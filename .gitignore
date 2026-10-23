@@ -1,0 +1,5 @@
+__pycache__/
+proxy.log
+last_failed_request.json
+.env
+.DS_Store

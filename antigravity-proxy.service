@@ -1,0 +1,14 @@
+[Unit]
+Description=Antigravity OpenAI-Compatible Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/workspace/google-proxy/antigravity_proxy.py --port 8877 --host 127.0.0.1
+WorkingDirectory=%h/workspace/google-proxy
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
