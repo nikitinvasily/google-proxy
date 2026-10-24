@@ -6,11 +6,13 @@
 
 ## What This Project Is
 
-A local proxy server that translates OpenAI-compatible API calls into Google Antigravity's internal Cloud Code Assist API format. It lets any tool that speaks OpenAI format use Gemini and Claude models for free, authenticated via the Antigravity CLI's OAuth token.
+A local proxy server that translates OpenAI-compatible API calls into Google Antigravity's internal Cloud Code Assist API format. It lets OpenAI-compatible tools use available Gemini, Claude, and GPT-OSS models, authenticated via the Antigravity CLI's OAuth token.
 
-The proxy listens on `http://127.0.0.1:8877` and exposes two endpoints:
+The proxy listens on `http://127.0.0.1:8877` and exposes these API endpoints:
 - `POST /v1/chat/completions` — OpenAI chat format (messages, tools, streaming)
 - `POST /v1beta/models/{model}:generateContent` — text-only Gemini passthrough (structured output; images rejected)
+- `GET /v1/models` (also `/models`) — live text-model catalog from Google, cached for five minutes; excludes internal and image-only entries
+- `GET /quota` (also `/v1/quota`) — live read-only model buckets and subscription groups (including separate Argon quotas when reported) directly from Google; no `agy` subprocess, token, or project ID in the response
 
 ---
 
@@ -48,11 +50,11 @@ Ask what tool they want to connect. Apply these settings:
 
 | Tool Type         | Base URL                              | API Key         | Model             |
 |-------------------|---------------------------------------|-----------------|-------------------|
-| OpenAI SDK        | `http://127.0.0.1:8877/v1`            | Any string      | See model table   |
+| OpenAI SDK        | `http://127.0.0.1:8877/v1`            | Any string      | See `/v1/models` |
 | Continue.dev      | `http://127.0.0.1:8877/v1`            | Any string      |                   |
 | Aider             | `--openai-api-base http://127.0.0.1:8877/v1` | Any string |                   |
 | Hermes Agent      | `hermes config set ...`               | Any string      |                   |
-| Claude Code       | `ANTHROPIC_BASE_URL` env var          | N/A             | `claude-sonnet-4.6` |
+| Claude Code       | Not supported (Anthropic Messages API) | N/A          | N/A               |
 
 ### Step 4 — Verify It Works
 
@@ -60,23 +62,14 @@ Have them run a test request:
 ```bash
 curl http://127.0.0.1:8877/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "gemini-3.5-flash", "messages": [{"role": "user", "content": "Say hello"}]}'
+  -d '{"model": "gemini-3-flash", "messages": [{"role": "user", "content": "Say hello"}]}'
 ```
 
 ---
 
 ## Available Models
 
-```
-gemini-3.1-pro          Gemini 3.1 Pro (thinking: low)
-gemini-3.1-pro-high     Gemini 3.1 Pro (thinking: high)
-gemini-3-flash          Gemini 3 Flash
-gemini-3.5-flash        Gemini 3.5 Flash
-gemini-2.5-pro          Gemini 2.5 Pro
-gemini-2.5-flash        Gemini 2.5 Flash
-claude-sonnet-4.6       Claude Sonnet 4.6
-claude-opus-4.6         Claude Opus 4.6 (thinking enabled)
-```
+Fetch `GET http://127.0.0.1:8877/v1/models` and use a returned `id`. The catalog depends on the authenticated account and Google's current response. A listed model may still have exhausted quota; GPT-OSS is open-weight and does not mean proprietary OpenAI GPT models are available. Legacy aliases in `MODEL_MAP` are accepted for old clients but are not advertised and may refer to retired backends.
 
 ---
 
@@ -96,7 +89,7 @@ agy  # re-authenticate
 The OAuth refresh token has expired. Re-run `agy` and restart the proxy.
 
 ### Model returns empty response or 404
-The model name doesn't exist on the Antigravity backend. Use a name from the model table above. When in doubt, `gemini-3-flash` or `gemini-3.5-flash` are the most reliable.
+The model name may not exist on the Antigravity backend. Choose a current ID from `GET /v1/models`; `gemini-3-flash` is a common fallback when listed. If the catalog endpoint fails, check the OAuth account and upstream availability instead of assuming an old alias still works.
 
 ### Proxy is slow on first request
 The first request discovers the project ID (extra network call). Subsequent requests are faster.

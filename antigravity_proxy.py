@@ -23,7 +23,7 @@ Then configure Hermes:
   hermes config set model.provider custom
   hermes config set model.base_url http://127.0.0.1:8877/v1
   hermes config set model.api_key antigravity
-  hermes config set model.default gemini-3.1-pro
+  hermes config set model.default gemini-3-flash
 """
 
 import argparse
@@ -63,6 +63,15 @@ TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-tok
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 CLOUDCODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
+RETRIEVE_USER_QUOTA_URL = f"{CLOUDCODE_BASE}/v1internal:retrieveUserQuota"
+RETRIEVE_USER_QUOTA_SUMMARY_URL = f"{CLOUDCODE_BASE}/v1internal:retrieveUserQuotaSummary"
+FETCH_AVAILABLE_MODELS_URL = f"{CLOUDCODE_BASE}/v1internal:fetchAvailableModels"
+MODEL_CATALOG_TTL = 300
+_models_cache_lock = threading.Lock()
+_models_cache_ids = None
+_models_cache_until = 0.0
+# Google's summary currently omits Gemini/Argon groups for the Electron UA.
+QUOTA_SUMMARY_USER_AGENT = "antigravity/cli/1.4.6"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 
@@ -84,11 +93,8 @@ DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
 
-# Model mapping: OpenAI-facing name -> Antigravity backend model name.
-# Tested against cloudcode-pa.googleapis.com on 2026-06-30.
-# Model mapping: OpenAI-facing name -> (backend model name, thinking level).
-# Gemini 3 Pro models use the base name "gemini-3.1-pro-low" and control
-# thinking compute via generationConfig.thinkingConfig.thinkingLevel.
+# Legacy aliases for existing clients. /v1/models instead lists live Google IDs.
+# OpenAI-facing name -> (backend model name, thinking level).
 MODEL_MAP = {
     # Gemini
     "gemini-3-flash": ("gemini-3-flash", None),
@@ -330,6 +336,167 @@ def get_project_id() -> str:
     """Return project id. Defaults to aicode-consumers."""
     return "aicode-consumers"
 
+
+def fetch_user_quota(access_token: str) -> dict:
+    """Retrieve read-only quota buckets without returning the upstream envelope."""
+    req = Request(RETRIEVE_USER_QUOTA_URL,
+                  data=json.dumps({"project": get_project_id()}).encode(), method="POST")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
+    req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+    req.add_header("Client-Metadata", CLIENT_METADATA)
+    with urlopen(req, timeout=15) as response:
+        raw = response.read(2_000_001)
+    if len(raw) > 2_000_000:
+        raise ValueError("Quota response too large")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("buckets"), list):
+        raise ValueError("Invalid quota response")
+
+    buckets = []
+    for item in payload["buckets"]:
+        if not isinstance(item, dict):
+            continue
+        model = item.get("modelId")
+        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,127}", model):
+            continue
+        token_type = item.get("tokenType")
+        if not isinstance(token_type, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", token_type):
+            token_type = None
+        remaining = item.get("remainingFraction")
+        if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
+                or not 0 <= remaining <= 1):
+            remaining = None
+        reset = item.get("resetTime")
+        try:
+            valid_reset = isinstance(reset, str) and len(reset) <= 64 and bool(
+                datetime.fromisoformat(reset.replace("Z", "+00:00")).tzinfo)
+        except ValueError:
+            valid_reset = False
+        if not valid_reset:
+            reset = None
+        buckets.append({"model": model, "token_type": token_type,
+                        "remaining_fraction": remaining, "reset_time": reset})
+    if payload["buckets"] and not buckets:
+        raise ValueError("Invalid quota buckets")
+    return {"source": "retrieveUserQuota",
+            "fetched_at": datetime.now(timezone.utc).isoformat(), "buckets": buckets}
+
+
+def fetch_quota_groups(access_token: str) -> list[dict]:
+    """Read subscription quota groups directly, without spawning the CLI."""
+    req = Request(RETRIEVE_USER_QUOTA_SUMMARY_URL,
+                  data=json.dumps({"project": get_project_id()}).encode(), method="POST")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", QUOTA_SUMMARY_USER_AGENT)
+    with urlopen(req, timeout=15) as response:
+        raw = response.read(2_000_001)
+    if len(raw) > 2_000_000:
+        raise ValueError("Quota summary response too large")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("groups"), list):
+        raise ValueError("Invalid quota summary response")
+
+    groups = []
+    for item in payload["groups"]:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid quota summary group")
+        name = item.get("displayName")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 /()&._-]{0,79}", name):
+            raise ValueError("Invalid quota summary group name")
+        source_buckets = item.get("buckets")
+        if not isinstance(source_buckets, list) or not source_buckets:
+            raise ValueError("Missing quota summary buckets")
+        buckets = []
+        for bucket in source_buckets:
+            if not isinstance(bucket, dict):
+                raise ValueError("Invalid quota summary bucket")
+            bucket_id = bucket.get("bucketId")
+            window = bucket.get("window")
+            fraction = bucket.get("remainingFraction")
+            if (not isinstance(bucket_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", bucket_id)
+                    or not isinstance(window, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", window)
+                    or isinstance(fraction, bool)
+                    or not isinstance(fraction, (int, float))
+                    or not 0 <= fraction <= 1):
+                raise ValueError("Invalid quota summary bucket fields")
+            reset = bucket.get("resetTime")
+            if reset is not None:
+                try:
+                    valid_reset = isinstance(reset, str) and len(reset) <= 64 and bool(
+                        datetime.fromisoformat(reset.replace("Z", "+00:00")).tzinfo)
+                except ValueError:
+                    valid_reset = False
+                if not valid_reset:
+                    raise ValueError("Invalid quota summary reset time")
+            buckets.append({"id": bucket_id, "window": window,
+                            "remaining_fraction": fraction,
+                            "reset_time": reset})
+        groups.append({"name": name, "buckets": buckets})
+    if not groups:
+        raise ValueError("Quota summary has no measured buckets")
+    return groups
+
+def fetch_available_models(access_token: str) -> list[str]:
+    """List text-capable models from the same backend used for generation."""
+    req = Request(FETCH_AVAILABLE_MODELS_URL,
+                  data=json.dumps({"project": get_project_id()}).encode(), method="POST")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
+    req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+    req.add_header("Client-Metadata", CLIENT_METADATA)
+    with urlopen(req, timeout=15) as response:
+        raw = response.read(2_000_001)
+    if len(raw) > 2_000_000:
+        raise ValueError("Model catalog response too large")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), dict):
+        raise ValueError("Invalid model catalog response")
+    excluded_ids = set()
+    for category in ("imageGenerationModelIds", "tabModelIds"):
+        entries = payload.get(category)
+        if isinstance(entries, list):
+            excluded_ids.update(entry for entry in entries if isinstance(entry, str))
+    agent_ids = set()
+    remaining = [payload.get("agentModelSorts")]
+    while remaining:
+        item = remaining.pop()
+        if isinstance(item, str) and item in payload["models"]:
+            agent_ids.add(item)
+        elif isinstance(item, dict):
+            remaining.extend(item.values())
+        elif isinstance(item, list):
+            remaining.extend(item)
+    model_ids = []
+    for model_id, info in payload["models"].items():
+        if (not isinstance(model_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,127}", model_id)
+                or not isinstance(info, dict) or info.get("isInternal") is True
+                or model_id in excluded_ids
+                or (model_id not in agent_ids
+                    and not model_id.startswith(("gemini-", "claude-", "gpt-")))
+                or "-image" in model_id):
+            continue
+        model_ids.append(model_id)
+    if not model_ids:
+        raise ValueError("Model catalog has no supported text models")
+    return sorted(model_ids)
+
+def get_available_models(access_token: str) -> list[str]:
+    """Share one short-lived catalog between concurrent model picker requests."""
+    global _models_cache_ids, _models_cache_until
+    with _models_cache_lock:
+        if _models_cache_ids is not None and time.monotonic() < _models_cache_until:
+            return list(_models_cache_ids)
+        model_ids = fetch_available_models(access_token)
+        _models_cache_ids = model_ids
+        _models_cache_until = time.monotonic() + MODEL_CATALOG_TTL
+        return list(model_ids)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OpenAI -> Gemini message transformation
@@ -575,8 +742,9 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
         if role == "assistant":
             parts = _content_to_parts(msg.get("content"))
             # Prior tool calls from the assistant -> functionCall parts.
-            # Decode the encoded tool_call.id to recover the Gemini fc_id and thoughtSignature.
+            # Hermes persists thought signatures in extra_content, not in tool-call IDs.
             tool_calls = msg.get("tool_calls") or []
+            first_function_call = True
             for tc in tool_calls:
                 if not isinstance(tc, dict):
                     continue
@@ -591,24 +759,34 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
                     tc_id = tc.get("id", "") or ""
                     fc_id = ""
                     thought_sig = ""
-                    # Decode: format is call_<fc_id>|<thought_signature>
+                    # Also accept legacy IDs from clients that kept the encoded suffix.
                     if tc_id.startswith("call_"):
                         raw = tc_id[5:]
                         if "|" in raw:
                             fc_id, thought_sig = raw.split("|", 1)
                         else:
                             fc_id = raw
+                    extra = tc.get("extra_content")
+                    if isinstance(extra, dict):
+                        google = extra.get("google")
+                        candidate = google.get("thought_signature") if isinstance(google, dict) else None
+                        if candidate is None:
+                            candidate = extra.get("thought_signature")
+                        if isinstance(candidate, str) and candidate:
+                            thought_sig = candidate
                     fc_obj = {"name": fn_name, "args": args}
                     if fc_id:
                         fc_obj["id"] = fc_id
-                    part_obj = {"functionCall": fc_obj}
+                    part_obj: dict = {"functionCall": fc_obj}
                     # thoughtSignature goes as a sibling key on the part, not inside functionCall.
-                    # If missing, use the sentinel to skip validation (officially supported by Google).
+                    # For parallel calls Google signs only the first functionCall.
+                    # A missing signature on later calls must remain absent.
                     if thought_sig:
                         part_obj["thoughtSignature"] = thought_sig
-                    else:
+                    elif first_function_call:
                         part_obj["thoughtSignature"] = "skip_thought_signature_validator"
                     parts.append(part_obj)
+                    first_function_call = False
             if parts:
                 contents.append({"role": "model", "parts": parts})
             continue
@@ -775,10 +953,7 @@ def _parse_text_tool_call(text: str, allowed_tool_names: set):
 def _extract_parts(parts: list, allowed_tool_names=None) -> tuple[str, list, str]:
     """Extract (text, tool_calls, finish_reason_hint) from a Gemini parts list.
 
-    tool_calls is a list of OpenAI-format tool_call dicts. The tool_call.id
-    encodes the Gemini functionCall.id and thoughtSignature so they can be
-    round-tripped back when the assistant message is sent in a later request.
-    Format: call_<fc_id>|<thought_signature>
+    Keep the legacy ID suffix for other clients, and use extra_content for Hermes replay.
     """
     text_chunks = []
     tool_calls = []
@@ -797,18 +972,17 @@ def _extract_parts(parts: list, allowed_tool_names=None) -> tuple[str, list, str
             # thoughtSignature is a sibling of functionCall in the part, not inside it.
             thought_sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
             if name and (allowed_tool_names is None or name in allowed_tool_names):
-                # Encode the Gemini fc_id and thoughtSignature into the OpenAI tool_call.id
-                # so they survive the round-trip through Hermes's message history.
-                # Format: call_<fc_id>|<thought_signature>
-                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else ""
-                tool_calls.append({
-                    "id": encoded_id,  # may be empty; caller assigns if so
+                call = {
+                    "id": f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else "",
                     "type": "function",
                     "function": {
                         "name": name,
                         "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
                     },
-                })
+                }
+                if isinstance(thought_sig, str) and thought_sig:
+                    call["extra_content"] = {"google": {"thought_signature": thought_sig}}
+                tool_calls.append(call)
         if "executableCode" in part:
             ec = part["executableCode"] or {}
             code = ec.get("code", "")
@@ -833,6 +1007,8 @@ def _extract_parts(parts: list, allowed_tool_names=None) -> tuple[str, list, str
 def _finish_reason_from_gemini(candidate: dict, tool_calls: list) -> str:
     """Map Gemini finishReason / stopReason to OpenAI finish_reason."""
     fr = (candidate.get("finishReason") or candidate.get("stopReason") or "").upper()
+    if fr == "MALFORMED_FUNCTION_CALL":
+        raise UpstreamError("Upstream generated an invalid function call", status=502)
     if fr == "MAX_TOKENS":
         return "length"
     if tool_calls:
@@ -845,7 +1021,6 @@ def _finish_reason_from_gemini(candidate: dict, tool_calls: list) -> str:
         "BLOCKLIST": "content_filter",
         "PROHIBITED_CONTENT": "content_filter",
         "SPII": "content_filter",
-        "MALFORMED_FUNCTION_CALL": "stop",
         "IMAGE_SAFETY": "content_filter",
         "LANGUAGE": "content_filter",
         "OTHER": "stop",
@@ -881,10 +1056,12 @@ def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=Non
 
     if candidates:
         cand = candidates[0]
+        finish_reason = _finish_reason_from_gemini(cand, [])
         content = cand.get("content") or {}
         parts = content.get("parts") or []
         text, tool_calls, _ = _extract_parts(parts, allowed_tool_names)
-        finish_reason = _finish_reason_from_gemini(cand, tool_calls)
+        if tool_calls:
+            finish_reason = _finish_reason_from_gemini(cand, tool_calls)
         # Assign tool call ids.
         for i, tc in enumerate(tool_calls):
             if not tc["id"]:
@@ -938,23 +1115,151 @@ def _extract_delta_from_parts(parts: list, prev_tool_calls: dict, allowed_tool_n
                     continue  # repeated complete functionCall in a later snapshot
                 index = len(current_calls)
                 current_calls[key] = index
-                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else ""
-                tool_call_deltas.append({
+                call = {
                     "index": index,
-                    "id": encoded_id or f"call_{uuid.uuid4().hex[:24]}",
+                    "id": f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function",
                     "function": {
                         "name": name,
                         "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
                     },
-                })
+                }
+                if isinstance(thought_sig, str) and thought_sig:
+                    call["extra_content"] = {"google": {"thought_signature": thought_sig}}
+                tool_call_deltas.append(call)
 
     return "".join(text_chunks), tool_call_deltas, current_calls
+
+
+def _merge_function_snapshot(part: dict, accumulated: list, indices: dict,
+                             no_id_slot: int | None = None) -> None:
+    """Merge a repeated call by ID or by its position when Google omits IDs."""
+    fc = part.get("functionCall") if isinstance(part, dict) else None
+    if not isinstance(fc, dict):
+        accumulated.append(part)
+        return
+    fc_id = fc.get("id")
+    key = fc_id or (("no_id", no_id_slot) if no_id_slot is not None else None)
+    index = indices.get(key) if key is not None else None
+    if index is not None and not fc_id:
+        previous = accumulated[index]
+        previous_sig = previous.get("thoughtSignature") or previous.get("thought_signature")
+        latest_sig = part.get("thoughtSignature") or part.get("thought_signature")
+        if previous_sig and not latest_sig and previous["functionCall"].get("args") != fc.get("args"):
+            index = None  # a new unsigned parallel call after a signed first call
+    if index is None or (not fc_id and accumulated[index]["functionCall"].get("name") != fc.get("name")):
+        if key is not None:
+            indices[key] = len(accumulated)
+        accumulated.append(part)
+        return
+    previous = accumulated[index]
+    latest = dict(part)
+    latest["functionCall"] = {**previous["functionCall"], **fc}
+    if not (latest.get("thoughtSignature") or latest.get("thought_signature")):
+        sig = previous.get("thoughtSignature") or previous.get("thought_signature")
+        if sig:
+            latest["thoughtSignature"] = sig
+    accumulated[index] = latest
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Upstream API calls
 # ──────────────────────────────────────────────────────────────────────────────
+
+class ShapeTrace:
+    """Bounded, content-free response metadata for correlating proxy and Hermes turns."""
+
+    _FINISH_REASONS = {
+        "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "BLOCKLIST",
+        "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL",
+        "IMAGE_SAFETY", "LANGUAGE", "OTHER",
+    }
+
+    def __init__(self, envelope: dict, stream: bool):
+        request = envelope.get("request") or {}
+        groups = request.get("tools") or []
+        declarations = [decl for group in groups if isinstance(group, dict)
+                        for decl in group.get("functionDeclarations", []) if isinstance(decl, dict)]
+        mode = (request.get("toolConfig") or {}).get("functionCallingConfig", {}).get("mode")
+        self.allowed = _declared_tool_names(envelope)
+        self.data = {
+            "stream": stream,
+            "offered_tools": len(declarations),
+            "mode": mode if mode in ("AUTO", "ANY", "NONE") else "UNSET",
+            "input_contents": len(request.get("contents") or []),
+            "system_chars": sum(len(part.get("text", "")) for part in
+                                (request.get("systemInstruction") or {}).get("parts", [])
+                                if isinstance(part, dict) and isinstance(part.get("text"), str)),
+            "events": 0,
+            "upstream_candidates": 0,
+            "upstream_candidate_indices": [],
+            "finish_reasons": [],
+            "upstream_visible_text_parts": 0,
+            "upstream_thought_parts": 0,
+            "upstream_signature_parts": 0,
+            "upstream_function_parts": 0,
+            "upstream_allowed_function_parts": 0,
+            "upstream_nonfirst_function_parts": 0,
+            "prompt_blocked": False,
+        }
+
+    def observe(self, event: dict):
+        try:
+            self._observe(event)
+        except Exception:
+            pass  # Malformed metadata must not interrupt a valid first candidate.
+
+    def _observe(self, event: dict):
+        if not isinstance(event, dict):
+            return
+        response = event.get("response", event)
+        if not isinstance(response, dict):
+            return
+        self.data["events"] += 1
+        self.data["prompt_blocked"] |= bool((response.get("promptFeedback") or {}).get("blockReason"))
+        for index, candidate in enumerate(response.get("candidates") or []):
+            if not isinstance(candidate, dict):
+                continue
+            self.data["upstream_candidates"] += 1
+            candidate_index = candidate.get("index", index)
+            indices = self.data["upstream_candidate_indices"]
+            if type(candidate_index) is int and 0 <= candidate_index <= 32 and candidate_index not in indices:
+                indices.append(candidate_index)
+            finish = candidate.get("finishReason") or candidate.get("stopReason")
+            if finish:
+                sanitized = finish if isinstance(finish, str) and finish in self._FINISH_REASONS else "UNKNOWN"
+                reasons = self.data["finish_reasons"]
+                if sanitized not in reasons:
+                    reasons.append(sanitized)
+            content = candidate.get("content") or {}
+            if not isinstance(content, dict):
+                continue
+            parts = content.get("parts") or []
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                self.data["upstream_thought_parts"] += bool(part.get("thought"))
+                self.data["upstream_visible_text_parts"] += bool(part.get("text") and not part.get("thought"))
+                self.data["upstream_signature_parts"] += bool(part.get("thoughtSignature") or part.get("thought_signature"))
+                if "functionCall" in part:
+                    self.data["upstream_function_parts"] += 1
+                    self.data["upstream_nonfirst_function_parts"] += index != 0
+                    call = part.get("functionCall") or {}
+                    if isinstance(call, dict):
+                        self.data["upstream_allowed_function_parts"] += call.get("name") in self.allowed
+
+    def emit(self, completion_id: str, finish_reason: str, output_tool_calls: int):
+        try:
+            data = dict(self.data, completion_id=completion_id,
+                        finish_reason=finish_reason if finish_reason in
+                        ("stop", "tool_calls", "length", "content_filter", "upstream_empty_response",
+                         "upstream_malformed_function_call") else "unknown",
+                        output_tool_calls=output_tool_calls)
+            _log("shape " + json.dumps(data, sort_keys=True, separators=(",", ":")))
+        except Exception:
+            pass  # Diagnostic logging must never change a model response.
 
 def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
     """Build and return a urllib Request object for the upstream call."""
@@ -970,13 +1275,17 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
     return req
 
 
-def call_generate_content(envelope: dict) -> dict:
+def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
     """Non-streaming call. Collects SSE chunks and returns combined response dict."""
     chunks = list(stream_generate_content(envelope))
+    if trace is not None:
+        for chunk in chunks:
+            trace.observe(chunk)
     if not chunks:
         raise UpstreamError("Empty response from upstream stream", status=502)
 
     combined_parts = []
+    function_parts_by_id = {}
     last_finish_reason = None
     total_prompt_tokens = 0
     total_candidates_tokens = 0
@@ -994,9 +1303,18 @@ def call_generate_content(envelope: dict) -> dict:
         for cand in candidates:
             content = cand.get("content") or {}
             parts = content.get("parts") or []
-            combined_parts.extend(parts)
-            if cand.get("finishReason"):
-                last_finish_reason = cand.get("finishReason")
+            no_id_slot = 0
+            for part in parts:
+                fc = part.get("functionCall") if isinstance(part, dict) else None
+                slot = None
+                if isinstance(fc, dict) and not fc.get("id"):
+                    slot = no_id_slot
+                    no_id_slot += 1
+                _merge_function_snapshot(part, combined_parts, function_parts_by_id, slot)
+            reason = cand.get("finishReason") or cand.get("stopReason")
+            if reason and (str(reason).upper() == "MALFORMED_FUNCTION_CALL"
+                           or str(last_finish_reason).upper() != "MALFORMED_FUNCTION_CALL"):
+                last_finish_reason = reason
         if resp.get("modelVersion"):
             model_version = resp.get("modelVersion")
         um = resp.get("usageMetadata") or {}
@@ -1300,7 +1618,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/models" or path == "/models":
                 self._handle_models()
-                self._log_req("GET", path, 200, time.time() - t0)
+                self._log_req("GET", path, getattr(self, "_response_status", 500), time.time() - t0)
+            elif path in ("/v1/quota", "/quota"):
+                self._handle_quota()
+                self._log_req("GET", path, getattr(self, "_response_status", 500), time.time() - t0)
             elif path in ("/health", "/"):
                 self._send_json(200, {"status": "ok", "service": "antigravity-proxy"})
                 self._log_req("GET", path, 200, time.time() - t0)
@@ -1316,9 +1637,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._log_req("GET", path, 500, time.time() - t0)
 
     def _handle_models(self):
+        try:
+            access_token = get_access_token()
+        except RuntimeError:
+            self._send_error_json("auth_error", "OAuth token unavailable", http_code=401)
+            return
+        try:
+            model_ids = get_available_models(access_token)
+        except HTTPError as error:
+            status = error.code if 400 <= error.code <= 599 else 502
+            error.close()
+            self._send_error_json("models_upstream_error", f"Model service returned HTTP {status}", http_code=status)
+            return
+        except Exception:
+            self._send_error_json("models_upstream_error", "Model service unavailable", http_code=502)
+            return
         now = int(time.time())
         models = []
-        for name in MODEL_MAP:
+        for name in model_ids:
             models.append({
                 "id": name,
                 "object": "model",
@@ -1326,6 +1662,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "owned_by": "google",
             })
         self._send_json(200, {"object": "list", "data": models})
+
+    def _handle_quota(self):
+        try:
+            access_token = get_access_token()
+        except RuntimeError:
+            self._send_error_json("auth_error", "OAuth token unavailable", http_code=401)
+            return
+        try:
+            result = fetch_user_quota(access_token)
+            groups = fetch_quota_groups(access_token)
+            if (any(b["model"].startswith("gemini-") for b in result["buckets"])
+                    and not any(g["name"].lower().startswith("gemini") for g in groups)):
+                raise ValueError("Gemini quota groups missing from summary")
+            result["groups"] = groups
+            result["groups_source"] = "retrieveUserQuotaSummary"
+        except HTTPError as error:
+            status = error.code if 400 <= error.code <= 599 else 502
+            error.close()
+            self._send_error_json("quota_upstream_error", f"Quota service returned HTTP {status}", http_code=status)
+            return
+        except Exception:
+            self._send_error_json("quota_upstream_error", "Quota service unavailable", http_code=502)
+            return
+        self._send_json(200, result)
 
     # ── POST routes ───────────────────────────────────────────────────────────
 
@@ -1433,8 +1793,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_nonstream(envelope, openai_model)
 
     def _handle_nonstream(self, envelope, openai_model):
+        trace = ShapeTrace(envelope, stream=False)
         try:
-            gemini_resp = call_generate_content(envelope)
+            gemini_resp = call_generate_content(envelope, trace=trace)
         except UpstreamError as e:
             self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
             return
@@ -1446,6 +1807,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             openai_resp = gemini_response_to_openai(
                 gemini_resp, openai_model, _declared_tool_names(envelope)
             )
+        except UpstreamError as e:
+            trace.emit(f"chatcmpl-{uuid.uuid4().hex[:24]}", "upstream_malformed_function_call", 0)
+            self._send_error_json("upstream_malformed_function_call", str(e), http_code=e.status)
+            return
         except Exception as e:
             _log(f"Response transform error: {e}\n{traceback.format_exc()}")
             # Fallback: return raw text if we can find any.
@@ -1465,10 +1830,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 }],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
+        choice = openai_resp["choices"][0]
+        message = choice["message"]
+        text = (message.get("content") or "").strip()
+        if choice["finish_reason"] == "stop" and not message.get("tool_calls") and not text:
+            trace.emit(openai_resp["id"], "upstream_empty_response", 0)
+            self._send_error_json("upstream_empty_response", "Upstream returned no visible content", err_type="api_error", http_code=502)
+            return
+        trace.emit(openai_resp["id"], choice["finish_reason"], len(message.get("tool_calls") or []))
         self._send_json(200, openai_resp)
 
     def _handle_stream(self, envelope, openai_model):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        trace = ShapeTrace(envelope, stream=True)
         created = int(time.time())
 
         # Resolve the lazy upstream generator before committing HTTP 200.
@@ -1500,8 +1874,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             gen.close()
             return
 
-        def send_sse(obj):
-            data = f"data: {json.dumps(obj)}\n\n"
+        def send_sse(obj, event=None):
+            prefix = f"event: {event}\n" if event else ""
+            data = f"{prefix}data: {json.dumps(obj)}\n\n"
             try:
                 self.wfile.write(data.encode())
                 self.wfile.flush()
@@ -1528,10 +1903,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         upstream_finished = False
         blocked_reason = None
         seen_tool_calls = {}
+        pending_tool_parts = []
+        pending_tool_by_id = {}
+        textual_calls_emitted = 0
         pending_text = ""
         checking_text_call = True
         total_usage = None
         events_processed = 0
+        emitted_visible = False
 
         try:
             for event in itertools.chain((first_event,), gen):
@@ -1540,6 +1919,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if event.get("__done__"):
                     break
 
+                trace.observe(event)
                 events_processed += 1
 
                 # Unwrap envelope if present.
@@ -1557,13 +1937,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if not candidates:
                     continue
 
+                if any(isinstance(item, dict) and str(
+                    item.get("finishReason") or item.get("stopReason") or ""
+                ).upper() == "MALFORMED_FUNCTION_CALL" for item in candidates):
+                    trace.emit(completion_id, "upstream_malformed_function_call", len(seen_tool_calls))
+                    send_sse(_openai_error("Upstream generated an invalid function call",
+                                           code="upstream_malformed_function_call"), event="error")
+                    return
                 cand = candidates[0]
+                fr = cand.get("finishReason") or cand.get("stopReason")
                 content = cand.get("content") or {}
                 parts = content.get("parts") or []
 
-                text_delta, tool_call_deltas, seen_tool_calls = _extract_delta_from_parts(
-                    parts, seen_tool_calls, allowed_tool_names
-                )
+                # Function calls are complete snapshots, not argument deltas. Wait
+                # for finishReason so later snapshots can supply the final args or
+                # a thought signature without duplicating the call in OpenAI SSE.
+                text_delta, _, _ = _extract_delta_from_parts(parts, {}, set())
+                no_id_slot = 0
+                for part in parts:
+                    if not isinstance(part, dict) or not isinstance(part.get("functionCall"), dict):
+                        continue
+                    slot = None
+                    if not part["functionCall"].get("id"):
+                        slot = no_id_slot
+                        no_id_slot += 1
+                    _merge_function_snapshot(part, pending_tool_parts, pending_tool_by_id, slot)
+                tool_call_deltas = []
+                if fr:
+                    _, tool_call_deltas, seen_tool_calls = _extract_delta_from_parts(
+                        pending_tool_parts, seen_tool_calls, allowed_tool_names
+                    )
+                    pending_tool_parts.clear()
+                    pending_tool_by_id.clear()
 
                 # Hold only a possible call: prefix until complete. Normal prose
                 # continues streaming as soon as it cannot match that prefix.
@@ -1580,7 +1985,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         text_delta = ""
 
                 # Determine finish reason.
-                fr = cand.get("finishReason")
                 if fr:
                     upstream_finished = True
                     if str(fr).upper() == "MAX_TOKENS":
@@ -1629,6 +2033,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 }
                 if not send_sse(chunk):
                     return
+                if (delta.get("content") or "").strip() or delta.get("tool_calls"):
+                    emitted_visible = True
 
             if blocked_reason:
                 finish_reason = "content_filter"
@@ -1657,10 +2063,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "model": openai_model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 }
-                if delta is not None and not send_sse(pending_chunk):
-                    return
+                if delta is not None:
+                    if not send_sse(pending_chunk):
+                        return
+                    textual_calls_emitted += len(delta.get("tool_calls") or [])
+                    if (delta.get("content") or "").strip() or delta.get("tool_calls"):
+                        emitted_visible = True
+
+            if upstream_finished and finish_reason == "stop" and not emitted_visible and not blocked_reason:
+                finish_reason = "length"
+                send_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                          "model": openai_model, "choices": [{"index": 0,
+                          "delta": {"content": "[Upstream returned empty response]"}, "finish_reason": None}]})
 
             # Final chunk with finish_reason.
+            trace.emit(completion_id, finish_reason, len(seen_tool_calls) + textual_calls_emitted)
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",

@@ -2,7 +2,7 @@
 
 # Antigravity Proxy
 
-**Free Gemini 3.5 Flash, Claude Sonnet 4.6 & more — through a local OpenAI-compatible proxy**
+**Gemini, Claude and GPT-OSS through a local OpenAI-compatible proxy**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -17,18 +17,18 @@
 
 ## What is this?
 
-A lightweight **OpenAI-compatible proxy** that bridges any AI tool to **Google Antigravity's** internal Cloud Code Assist API. Authenticate once with the [Antigravity CLI](https://antigravity.google/), then use **Gemini** and **Claude** models from any OpenAI-compatible client — **no API key, no billing, no credit card**.
+A lightweight **OpenAI-compatible proxy** that bridges AI tools to **Google Antigravity's** internal Cloud Code Assist API. Authenticate once with the [Antigravity CLI](https://antigravity.google/), then use the Gemini, Claude, and GPT-OSS models available to your account through an OpenAI-compatible client — **no separate API key**.
 
 ```
-Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini / Claude models
+Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Google Antigravity models
 ```
 
 ### Why use this?
 
-- **Free** — uses the OAuth token from the Antigravity CLI, no paid API key
-- **Universal** — works with any OpenAI-compatible tool (Aider, Continue, Hermes, Claude Code, OpenAI SDK, LangChain, etc.)
+- **One login** — uses the Antigravity CLI's OAuth token; model access and quotas depend on your Google account
+- **OpenAI-compatible** — works with clients such as Aider, Continue, Hermes, the OpenAI SDK, and LangChain
 - **No dependencies** — pure Python stdlib, no `pip install` needed
-- **Two endpoints** — OpenAI chat completions + text-only Gemini passthrough (for structured output)
+- **Live model catalog and quotas** — `GET /v1/models` and `GET /quota`
 - **Tool/function calling** — full support, including round-trip through conversation history
 - **Streaming** — SSE streaming support for real-time token generation
 
@@ -39,7 +39,7 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 - **OpenAI-compatible** `POST /v1/chat/completions` — streaming + non-streaming
 - **Native Gemini passthrough** `POST /v1beta/models/{model}:generateContent` — text-only structured JSON output
 - **Tool/function calling** — OpenAI tools format → Gemini functionDeclarations, with round-trip encoding
-- **Model auto-mapping** — use friendly names (`gemini-3.5-flash`), the proxy translates to backend names automatically
+- **Model discovery** — lists current upstream text models; legacy aliases still work for existing clients
 - **OAuth token auto-refresh** — token refreshed automatically when expired, no manual intervention
 - **Zero pip dependencies** — Python 3.10+ standard library only
 - **systemd service** included — run as a background service on Linux
@@ -48,18 +48,9 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 
 ## Available Models
 
-| Friendly Name         | Backend Model              | Thinking       | Type    |
-|-----------------------|----------------------------|----------------|---------|
-| `gemini-3.1-pro`      | `gemini-3.1-pro-low`       | Low            | Gemini  |
-| `gemini-3.1-pro-high` | `gemini-3.1-pro-low`       | High           | Gemini  |
-| `gemini-3-flash`      | `gemini-3-flash`           | —              | Gemini  |
-| `gemini-3.5-flash`    | `gemini-3.5-flash-low`     | —              | Gemini  |
-| `gemini-2.5-pro`      | `gemini-2.5-pro`           | —              | Gemini  |
-| `gemini-2.5-flash`    | `gemini-2.5-flash`         | —              | Gemini  |
-| `claude-sonnet-4.6`   | `claude-sonnet-4-6`        | —              | Claude  |
-| `claude-opus-4.6`     | `claude-opus-4-6-thinking` | Enabled        | Claude  |
+Run `curl http://127.0.0.1:8877/v1/models` and use a returned `id` in your client. `/models` is an alias. The proxy asks Antigravity for the current catalog using the same client identity as generation, caches it for five minutes, and excludes internal and image-only entries. If Google does not return a usable catalog, the endpoint reports an error instead of showing an outdated list. Access and quotas can still vary per model; a listed ID does not guarantee capacity. GPT-OSS is an open-weight model, not a claim that proprietary OpenAI GPT models are available.
 
-You always use the **friendly name** in your client. The proxy handles translation.
+`MODEL_MAP` still translates old aliases used by existing clients, but those aliases are **not** advertised in `/v1/models` and may point to models Google has removed.
 
 ---
 
@@ -98,7 +89,7 @@ That's it. The proxy is now listening on `http://127.0.0.1:8877`.
 
 ### Connect Your Tool
 
-Any OpenAI-compatible client works. Set base URL to `http://127.0.0.1:8877/v1` and use any model from the table above. The API key can be any string (the proxy doesn't check it).
+Set an OpenAI-compatible client's base URL to `http://127.0.0.1:8877/v1` and choose an ID from `GET /v1/models`. The API key can be any string (the proxy doesn't check it).
 
 <details>
 <summary><b>OpenAI Python SDK</b></summary>
@@ -112,7 +103,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-3.5-flash",
+    model="gemini-3-flash",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -126,7 +117,7 @@ print(response.choices[0].message.content)
 curl http://127.0.0.1:8877/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3-flash",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -138,7 +129,7 @@ curl http://127.0.0.1:8877/v1/chat/completions \
 ```bash
 export OPENAI_API_BASE=http://127.0.0.1:8877/v1
 export OPENAI_API_KEY=antigravity
-aider --model gemini-3.5-flash
+aider --model gemini-3-flash
 ```
 </details>
 
@@ -151,7 +142,7 @@ In `~/.continue/config.json`:
   "models": [{
     "title": "Antigravity",
     "provider": "openai",
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3-flash",
     "apiBase": "http://127.0.0.1:8877/v1",
     "apiKey": "antigravity"
   }]
@@ -166,17 +157,14 @@ In `~/.continue/config.json`:
 hermes config set model.provider custom
 hermes config set model.base_url http://127.0.0.1:8877/v1
 hermes config set model.api_key antigravity
-hermes config set model.default gemini-3.5-flash
+hermes config set model.default gemini-3-flash
 ```
 </details>
 
 <details>
 <summary><b>Claude Code</b></summary>
 
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8877/v1
-claude  # uses claude-sonnet-4.6 through the proxy
-```
+This proxy does not expose the Anthropic Messages API expected by Claude Code. Use an OpenAI-compatible client to access Claude models through it.
 </details>
 
 <details>
@@ -188,7 +176,7 @@ from langchain_openai import ChatOpenAI
 llm = ChatOpenAI(
     base_url="http://127.0.0.1:8877/v1",
     api_key="antigravity",
-    model="gemini-3.5-flash",
+    model="gemini-3-flash",
 )
 ```
 </details>
@@ -246,7 +234,7 @@ The default client credentials are the same values embedded in every Antigravity
 
 ---
 
-## Two API Endpoints
+## Three API Endpoints
 
 ### 1. OpenAI Chat Completions
 
@@ -271,7 +259,7 @@ Accepts text-only Gemini requests. Image and media parts are rejected with HTTP 
 <summary><b>Structured output example</b></summary>
 
 ```bash
-curl http://127.0.0.1:8877/v1beta/models/gemini-3.5-flash:generateContent \
+curl http://127.0.0.1:8877/v1beta/models/gemini-3-flash:generateContent \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [{"parts": [{"text": "Extract: Ahmed is 30 years old"}]}],
@@ -291,7 +279,14 @@ curl http://127.0.0.1:8877/v1beta/models/gemini-3.5-flash:generateContent \
 ```
 </details>
 
+### 3. Model Quotas
 
+```
+GET /quota
+GET /v1/quota
+```
+
+Both paths use the configured OAuth account to retrieve **model buckets** (`retrieveUserQuota`) and separate **subscription quota groups** (`retrieveUserQuotaSummary`) directly from Google, without running `agy`. The JSON response contains `source`, `fetched_at`, `buckets`, `groups_source`, and `groups`. Model buckets have `model`, `token_type`, `remaining_fraction` (0 to 1, or `null` when unavailable), and `reset_time` (or `null`). Each group has `name` and `buckets`; group buckets have `id`, `window`, a measured `remaining_fraction` (0 to 1, including a real zero), and `reset_time` (or `null`). Groups can include a separate weekly Gemini 4 Argon limit; they are not interchangeable with model buckets. No OAuth token or project ID is returned. Empty, malformed, or inconsistent group data and upstream errors return an error rather than a misleading partial success. This is a private Google API and its response can change. The proxy has no authentication layer, so keep it bound to loopback.
 
 ---
 
@@ -327,14 +322,14 @@ Antigravity Proxy (localhost:8877)
     │  ┌─ Translates OpenAI messages → Gemini contents
     │  ├─ Converts OpenAI tools → Gemini functionDeclarations
     │  ├─ Manages OAuth token (auto-refresh)
-    │  ├─ Maps friendly model names → backend model names
+    │  ├─ Preserves live model IDs or translates legacy aliases
     │  └─ Wraps in Antigravity envelope {project, model, request}
     │
     ▼
-cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
     │
     ▼
-Gemini / Claude models → Response unwrapped → OpenAI format → Your client
+Gemini / Claude / GPT-OSS models → Response unwrapped → OpenAI format → Your client
 ```
 
 <details>
@@ -344,27 +339,17 @@ Gemini / Claude models → Response unwrapped → OpenAI format → Your client
 2. Refreshes expired access tokens via `oauth2.googleapis.com/token`
 3. Discovers Cloud Code Assist project ID via `v1internal:loadCodeAssist`
 4. Wraps each request in the Antigravity envelope: `{project, model, request, requestType, userAgent, requestId}`
-5. Forwards to `v1internal:generateContent` or `v1internal:streamGenerateContent?alt=sse`
+5. Forwards to `v1internal:streamGenerateContent?alt=sse` and adapts the result to streaming or non-streaming OpenAI format
 6. Unwraps the `{response: {...}}` envelope
 7. Converts Gemini response → OpenAI format (choices, message, usage)
-8. For tool calls, encodes Gemini's `functionCall.id` + `thoughtSignature` into OpenAI `tool_call.id` for round-tripping
+8. For tool calls, preserves Gemini's `functionCall.id` and `thoughtSignature` for round-tripping through OpenAI messages
 </details>
 
 ---
 
 ## Adding or Updating Models
 
-Edit `MODEL_MAP` at the top of `antigravity_proxy.py`:
-
-```python
-MODEL_MAP = {
-    "gemini-3.5-flash": ("gemini-3.5-flash-low", None),
-    # "friendly-name": ("backend-name", thinking_level),
-    # thinking_level: "low", "high", or None
-}
-```
-
-Restart the proxy after editing.
+You do not need to edit code when Google changes its model catalog: `GET /v1/models` fetches live IDs. `MODEL_MAP` in `antigravity_proxy.py` is only for optional aliases used in requests. Adding an alias does not add it to the advertised catalog. Restart the proxy if you edit aliases.
 
 ---
 
@@ -387,7 +372,7 @@ The proxy uses the same OAuth token and API endpoints that the Antigravity CLI i
 <details>
 <summary><b>Does it support streaming?</b></summary>
 
-Yes. SSE streaming (`"stream": true`) on the OpenAI endpoint, and the native Gemini stream endpoint.
+Yes. SSE streaming (`"stream": true`) on the OpenAI chat endpoint. The text-only Gemini passthrough exposes `:generateContent`, not a separate streaming endpoint.
 </details>
 
 <details>
