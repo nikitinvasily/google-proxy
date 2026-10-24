@@ -10,14 +10,26 @@ class NoImagesTests(unittest.TestCase):
     def test_openai_image_url_is_rejected_before_fetch(self):
         with self.assertRaisesRegex(ValueError, "[Ii]mage.*not supported"):
             proxy._content_to_parts([{"type": "image_url", "image_url": {"url": "file:///etc/hosts"}}])
-
-    def test_openai_input_image_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "[Ii]mage.*not supported"):
-            proxy._content_to_parts([{"type": "input_image", "image_url": "data:image/png;base64,AA=="}])
+            proxy._content_to_parts([{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}])
 
-    def test_native_inline_data_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "[Ii]mage.*not supported"):
-            proxy._build_passthrough_envelope("gemini-3-flash", {"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}]}]})
+    def test_openai_base64_image_is_converted_to_inline_data(self):
+        parts = proxy._content_to_parts([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}])
+        self.assertEqual(parts, [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}])
+        parts2 = proxy._content_to_parts([{"type": "input_image", "image_url": "data:image/jpeg;base64,AA=="}])
+        self.assertEqual(parts2, [{"inlineData": {"mimeType": "image/jpeg", "data": "AA=="}}])
+        parts3 = proxy._content_to_parts([{"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}])
+        self.assertEqual(parts3, [{"inlineData": {"mimeType": "audio/wav", "data": "AA=="}}])
+
+    def test_native_inline_data_is_accepted_when_valid_base64_image(self):
+        env = proxy._build_passthrough_envelope(
+            "gemini-3-flash",
+            {"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}]}]},
+        )
+        self.assertEqual(
+            env["request"]["contents"][0]["parts"],
+            [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}],
+        )
 
     def test_native_file_data_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "[Ii]mage.*not supported"):
