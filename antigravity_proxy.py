@@ -31,13 +31,16 @@ import json
 import itertools
 import os
 import re
+import stat
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -70,16 +73,10 @@ MODEL_CATALOG_TTL = 300
 _models_cache_lock = threading.Lock()
 _models_cache_ids = None
 _models_cache_until = 0.0
-# Google's summary currently omits Gemini/Argon groups for the Electron UA.
-QUOTA_SUMMARY_USER_AGENT = "antigravity/cli/1.4.6"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 
-ANTIGRAVITY_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Antigravity/1.0.14 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
-)
+ANTIGRAVITY_USER_AGENT = "antigravity/cli/1.4.7"
 CLIENT_METADATA = json.dumps(
     {"ideType": "ANTIGRAVITY", "platform": "MACOS", "pluginType": "GEMINI"},
     separators=(",", ":"),
@@ -92,22 +89,6 @@ DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
 
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
-
-# Legacy aliases for existing clients. /v1/models instead lists live Google IDs.
-# OpenAI-facing name -> (backend model name, thinking level).
-MODEL_MAP = {
-    # Gemini
-    "gemini-3-flash": ("gemini-3-flash", None),
-    "gemini-2.5-flash": ("gemini-2.5-flash", None),
-    "gemini-2.5-flash-thinking": ("gemini-2.5-flash-thinking", None),
-    "gemini-3.8-flash": ("gemini-3-flash", None),
-    "gemini-3.8-flash-low": ("gemini-3-flash", None),
-    "gemini-4-argon": ("gemini-4-argon-low", "low"),
-    # Claude
-    "claude-sonnet-4-6": ("claude-sonnet-4-6", None),
-    "claude-opus-4-6-thinking": ("claude-opus-4-6-thinking", None),
-    "claude-3-7-sonnet": ("claude-sonnet-4-6", None),
-}
 
 DEFAULT_MODEL = "gemini-3-flash"
 
@@ -122,6 +103,11 @@ _project_lock = threading.Lock()
 
 
 LOG_FILE = "./proxy.log"
+UPSTREAM_ERROR_DIR = Path.home() / ".hermes" / "cache" / "proxy-upstream-errors"
+_upstream_error_lock = threading.Lock()
+_UPSTREAM_ERROR_BODY_LIMIT = 8192
+_UPSTREAM_ERROR_FILE_LIMIT = 50
+_UPSTREAM_ERROR_MAX_AGE = 24 * 60 * 60
 
 def _log(msg: str):
     entry = f"[antigravity-proxy] {msg}"
@@ -131,6 +117,47 @@ def _log(msg: str):
             f.write(entry + "\n")
     except Exception:
         pass
+
+
+def _capture_upstream_error(error: HTTPError, envelope: dict) -> None:
+    """Opt-in private response-body capture; never persist request content or headers."""
+    if os.environ.get("ANTIGRAVITY_CAPTURE_UPSTREAM_ERRORS") != "1":
+        return
+    try:
+        body = error.read(_UPSTREAM_ERROR_BODY_LIMIT + 1)
+        directory = UPSTREAM_ERROR_DIR
+        with _upstream_error_lock:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                return
+            now = time.time()
+            files = sorted(directory.glob("upstream-*.json"), key=lambda p: p.stat().st_mtime)
+            for old in files:
+                if old.stat().st_mtime < now - _UPSTREAM_ERROR_MAX_AGE:
+                    old.unlink()
+            files = [old for old in files if old.exists()]
+            for old in files[:-(_UPSTREAM_ERROR_FILE_LIMIT - 1)]:
+                old.unlink()
+            text = body[:_UPSTREAM_ERROR_BODY_LIMIT].decode("utf-8", errors="replace")
+            encoded = text.encode("utf-8")
+            expanded = len(encoded) > _UPSTREAM_ERROR_BODY_LIMIT
+            if expanded:
+                text = encoded[:_UPSTREAM_ERROR_BODY_LIMIT].decode("utf-8", errors="ignore")
+            record = {
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "model": str(envelope.get("model") or "")[:128],
+                "status": error.code,
+                "body": text,
+                "truncated": len(body) > _UPSTREAM_ERROR_BODY_LIMIT or expanded,
+            }
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                             prefix="upstream-", suffix=".json", delete=False) as output:
+                json.dump(record, output, ensure_ascii=False)
+                filename = Path(output.name).name
+        _log(f"Saved upstream HTTP {error.code} diagnostic: {filename}")
+    except Exception:
+        _log(f"Could not save upstream HTTP {error.code} diagnostic")
 
 
 def _parse_expiry(expiry_raw):
@@ -390,7 +417,7 @@ def fetch_quota_groups(access_token: str) -> list[dict]:
                   data=json.dumps({"project": get_project_id()}).encode(), method="POST")
     req.add_header("Authorization", f"Bearer {access_token}")
     req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", QUOTA_SUMMARY_USER_AGENT)
+    req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
     with urlopen(req, timeout=15) as response:
         raw = response.read(2_000_001)
     if len(raw) > 2_000_000:
@@ -553,7 +580,130 @@ def _content_to_parts(content) -> list:
     return [{"text": s}] if s else []
 
 
-def _openai_tools_to_gemini(tools: list) -> list:
+_SCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_SCHEMA_CHILD_KEYWORDS = ("items", "additionalProperties", "additionalItems", "contains",
+                          "propertyNames", "unevaluatedProperties", "unevaluatedItems", "contentSchema")
+_SCHEMA_LIST_KEYWORDS = ("allOf", "prefixItems")
+
+
+def _schema_contains_anyof(schema):
+    """Search schema positions only, never literal enum/default values."""
+    if isinstance(schema, list):
+        return any(_schema_contains_anyof(item) for item in schema)
+    if not isinstance(schema, dict):
+        return False
+    if "anyOf" in schema:
+        return True
+    for keyword in _SCHEMA_MAP_KEYWORDS:
+        mapping = schema.get(keyword)
+        if isinstance(mapping, dict) and any(_schema_contains_anyof(value)
+                                             for value in mapping.values()):
+            return True
+    return any(_schema_contains_anyof(schema[keyword]) for keyword in
+               (*_SCHEMA_CHILD_KEYWORDS, *_SCHEMA_LIST_KEYWORDS, "not", "oneOf", "if", "then", "else")
+               if keyword in schema)
+
+
+def _claude_tool_schema(schema):
+    """Remove anyOf from tool schemas for Google's Claude adapter.
+
+    Its Claude endpoint rejects a valid Draft 2020-12 object union in
+    skill_manage.operations.items. Relax unions rather than dropping valid
+    arguments; the receiving tool still validates its own input.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    result = dict(schema)
+    for keyword in _SCHEMA_MAP_KEYWORDS:
+        mapping = result.get(keyword)
+        if isinstance(mapping, dict):
+            result[keyword] = {name: _claude_tool_schema(value)
+                               for name, value in mapping.items()}
+    for keyword in _SCHEMA_CHILD_KEYWORDS:
+        if keyword in result:
+            result[keyword] = _claude_tool_schema(result[keyword])
+    for keyword in _SCHEMA_LIST_KEYWORDS:
+        if isinstance(result.get(keyword), list):
+            result[keyword] = [_claude_tool_schema(value) for value in result[keyword]]
+
+    # Widening inside negation, exclusive alternatives or an if-condition
+    # could make a formerly valid argument invalid. Drop the whole constraint.
+    if "not" in result:
+        if _schema_contains_anyof(result["not"]):
+            del result["not"]
+        else:
+            result["not"] = _claude_tool_schema(result["not"])
+    if "oneOf" in result:
+        if _schema_contains_anyof(result["oneOf"]):
+            del result["oneOf"]
+        elif isinstance(result["oneOf"], list):
+            result["oneOf"] = [_claude_tool_schema(value) for value in result["oneOf"]]
+    if _schema_contains_anyof(result.get("if")):
+        for keyword in ("if", "then", "else"):
+            result.pop(keyword, None)
+    else:
+        for keyword in ("if", "then", "else"):
+            if keyword in result:
+                result[keyword] = _claude_tool_schema(result[keyword])
+
+    options = result.pop("anyOf", None)
+    if not isinstance(options, list) or not options:
+        return result
+
+    variants = [_claude_tool_schema(option) for option in options]
+    if not all(isinstance(option, dict) and option.get("type") == "object"
+               and isinstance(option.get("properties", {}), dict)
+               for option in variants):
+        return result  # An unconstrained schema accepts all branches.
+
+    props = dict(result.get("properties") or {})
+    by_name = {}
+    for option in variants:
+        for name, prop in option.get("properties", {}).items():
+            by_name.setdefault(name, []).append(prop)
+    for name, definitions in by_name.items():
+        if name in props:
+            definitions.append(props[name])
+        if all(definition == definitions[0] for definition in definitions):
+            props[name] = definitions[0]
+            continue
+        # Keep only common constraints; a stricter schema could reject a
+        # valid argument for one of the alternative operations.
+        types = [definition.get("type") for definition in definitions
+                 if isinstance(definition, dict)]
+        merged = ({"type": types[0]} if len(types) == len(definitions)
+                  and all(value == types[0] for value in types) else {})
+        enums = [definition.get("enum") if isinstance(definition, dict) else None
+                 for definition in definitions]
+        if all(isinstance(values, list) for values in enums):
+            values = []
+            for alternatives in enums:
+                if not isinstance(alternatives, list):
+                    continue
+                for value in alternatives:
+                    if value not in values:
+                        values.append(value)
+            merged["enum"] = values
+        props[name] = merged
+
+    result["type"] = "object"
+    result["properties"] = props
+    common_required = set(variants[0].get("required", []))
+    for option in variants[1:]:
+        common_required.intersection_update(option.get("required", []))
+    required = list(result.get("required", []))
+    required.extend(name for name in variants[0].get("required", [])
+                    if name in common_required and name not in required)
+    if required:
+        result["required"] = required
+    if all(option.get("additionalProperties") is False
+           and "patternProperties" not in option for option in variants):
+        result["additionalProperties"] = False
+    return result
+
+
+def _openai_tools_to_gemini(tools: list, *, claude_model: bool = False) -> list:
     """Convert OpenAI tools array to Gemini functionDeclarations format.
 
     OpenAI:  [{"type":"function","function":{"name","description","parameters"}}]
@@ -577,7 +727,7 @@ def _openai_tools_to_gemini(tools: list) -> list:
         }
         params = func.get("parameters")
         if isinstance(params, dict) and params:
-            decl["parameters"] = params
+            decl["parameters"] = _claude_tool_schema(params) if claude_model else params
         decls.append(decl)
     if not decls:
         return []
@@ -618,25 +768,11 @@ def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
     envelope. The caller's text-only body is used as ``request`` without
     message-format conversion; media parts are rejected.
 
-    The friendly model name (e.g. ``gemini-3.5-flash``) is translated to the
-    Antigravity backend name (e.g. ``gemini-3.5-flash-low``) via MODEL_MAP so
-    callers can use the same name as Google's public API.
-
+    The model ID is sent to Antigravity unchanged.
     Safety settings are injected only when the caller did not supply its own.
     """
-    # Translate friendly model name to Antigravity backend name.
-    entry = MODEL_MAP.get(model)
-    backend_model = entry[0] if entry else model
-    thinking_level = entry[1] if entry else None
-
     _reject_image_data(gemini_body)
     inner = dict(gemini_body)  # shallow copy — don't mutate caller's dict
-
-    # Apply thinking level from MODEL_MAP if the caller didn't set one.
-    if thinking_level:
-        gc = inner.setdefault("generationConfig", {})
-        tc = gc.setdefault("thinkingConfig", {})
-        tc.setdefault("thinkingLevel", thinking_level)
 
     if "safetySettings" not in inner:
         inner["safetySettings"] = [
@@ -652,7 +788,7 @@ def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
     project_id = get_project_id()
     return {
         "project": project_id,
-        "model": backend_model,
+        "model": model,
         "request": inner,
         "requestType": "agent",
         "userAgent": "antigravity",
@@ -662,9 +798,7 @@ def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
 
 def _build_gemini_request(body: dict, backend_model: str, thinking_level = None):
     """Transform an OpenAI chat completion body into a Gemini generateContent
-    request envelope.
-
-    Returns (envelope_dict, openai_model_name).
+    request envelope. The model ID is sent upstream unchanged.
     """
     messages = body.get("messages", [])
     if not isinstance(messages, list):
@@ -830,7 +964,8 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
     }
 
     # Tools.
-    tools = _openai_tools_to_gemini(body.get("tools"))
+    tools = _openai_tools_to_gemini(body.get("tools"),
+                                   claude_model=backend_model.startswith("claude-"))
     if tools:
         inner["tools"] = tools
 
@@ -871,7 +1006,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
         thinking_cfg = gen_config.get("thinkingConfig", {})
         thinking_cfg.setdefault("includeThoughts", False)
         gen_config["thinkingConfig"] = thinking_cfg
-    # Apply the model mapping's thinking level to OpenAI-format requests.
+    # Apply an explicitly supplied thinking level to OpenAI-format requests.
     if thinking_level:
         gen_config.setdefault("thinkingConfig", {})["thinkingLevel"] = thinking_level
     if gen_config:
@@ -1349,6 +1484,7 @@ def stream_generate_content(envelope: dict):
     try:
         resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
     except HTTPError as e:
+        _capture_upstream_error(e, envelope)
         _log(f"Upstream HTTP {e.code} on streamGenerateContent")
         e.close()
         raise UpstreamError(f"Upstream stream HTTP {e.code}", status=e.code)
@@ -1761,16 +1897,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         openai_model = body.get("model") or DEFAULT_MODEL
 
-        # Map model. MODEL_MAP values are (backend_name, thinking_level) tuples.
-        model_entry = MODEL_MAP.get(openai_model)
-        if model_entry:
-            backend_model, thinking_level = model_entry
-        else:
-            backend_model = openai_model
-            thinking_level = None
-
         try:
-            envelope = _build_gemini_request(body, backend_model, thinking_level)
+            envelope = _build_gemini_request(body, openai_model)
         except UpstreamError as e:
             self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
             return
@@ -2172,7 +2300,7 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
     server.daemon_threads = True
     _log(f"Antigravity proxy listening on http://{args.host}:{args.port}/v1")
-    _log(f"  Models: {', '.join(MODEL_MAP.keys())}")
+    _log("  Models: GET /v1/models")
     _log(f"  Token:  {TOKEN_FILE}")
     _log(f"  Press Ctrl+C to stop")
 

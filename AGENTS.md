@@ -11,7 +11,7 @@ A local proxy server that translates OpenAI-compatible API calls into Google Ant
 The proxy listens on `http://127.0.0.1:8877` and exposes these API endpoints:
 - `POST /v1/chat/completions` — OpenAI chat format (messages, tools, streaming)
 - `POST /v1beta/models/{model}:generateContent` — text-only Gemini passthrough (structured output; images rejected)
-- `GET /v1/models` (also `/models`) — live text-model catalog from Google, cached for five minutes; excludes internal and image-only entries
+- `GET /v1/models` (also `/models`) — live text-model catalog from Google under the agy CLI User-Agent, cached for five minutes; excludes internal and image-only entries; listing a model does not prove generation works
 - `GET /quota` (also `/v1/quota`) — live read-only model buckets and subscription groups (including separate Argon quotas when reported) directly from Google; no `agy` subprocess, token, or project ID in the response
 
 ---
@@ -69,7 +69,7 @@ curl http://127.0.0.1:8877/v1/chat/completions \
 
 ## Available Models
 
-Fetch `GET http://127.0.0.1:8877/v1/models` and use a returned `id`. The catalog depends on the authenticated account and Google's current response. A listed model may still have exhausted quota; GPT-OSS is open-weight and does not mean proprietary OpenAI GPT models are available. Legacy aliases in `MODEL_MAP` are accepted for old clients but are not advertised and may refer to retired backends.
+Fetch `GET http://127.0.0.1:8877/v1/models` and use a returned `id`. The catalog depends on the authenticated account and Google's current response. A listed model may still have exhausted quota; GPT-OSS is open-weight and does not mean proprietary OpenAI GPT models are available. The proxy sends model IDs upstream unchanged; it does not silently map old aliases to different models.
 
 ---
 

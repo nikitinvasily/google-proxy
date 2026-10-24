@@ -15,7 +15,7 @@ def collect_stream(events):
     h.send_header = lambda *args: None
     h.end_headers = lambda *args: None
     with patch.object(proxy, "stream_generate_content", return_value=iter(events)):
-        h._handle_stream({"request": {"tools": []}}, "gemini-3.8-flash")
+        h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
     return [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines() if line.startswith("data: {")]
 
 
@@ -59,7 +59,7 @@ class StreamIntegrityTests(unittest.TestCase):
             raise proxy.UpstreamError("quota exceeded", status=429)
             yield
         with patch.object(proxy, "stream_generate_content", side_effect=fail):
-            h._handle_stream({"request": {"tools": []}}, "gemini-3.8-flash")
+            h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
         self.assertEqual(statuses, [429])
         self.assertNotIn("chat.completion.chunk", h.wfile.getvalue().decode())
 
@@ -73,7 +73,7 @@ class StreamIntegrityTests(unittest.TestCase):
         h.send_header = lambda *args: None
         h.end_headers = lambda *args: None
         with patch.object(proxy, "stream_generate_content", side_effect=events):
-            h._handle_stream({"request": {"tools": []}}, "gemini-3.8-flash")
+            h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
         body = h.wfile.getvalue().decode()
         chunks = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "length")
@@ -91,7 +91,7 @@ class StreamIntegrityTests(unittest.TestCase):
     def test_nonstream_preserves_prompt_feedback(self):
         with patch.object(proxy, "stream_generate_content", return_value=iter([{"response": {"promptFeedback": {"blockReason": "SAFETY"}}}])):
             response = proxy.call_generate_content({"request": {}})
-        result = proxy.gemini_response_to_openai(response, "gemini-3.8-flash")
+        result = proxy.gemini_response_to_openai(response, "gemini-3-flash")
         self.assertEqual(result["choices"][0]["finish_reason"], "content_filter")
 
     def test_nonstream_incomplete_generation_raises(self):
@@ -107,7 +107,7 @@ class StreamIntegrityTests(unittest.TestCase):
 
     def test_max_tokens_is_not_masked_by_tool_call(self):
         response = {"candidates": [{"content": {"parts": [{"functionCall": {"name": "terminal", "args": {"command": "pwd"}}}]}, "finishReason": "MAX_TOKENS"}]}
-        result = proxy.gemini_response_to_openai(response, "gemini-3.8-flash", {"terminal"})
+        result = proxy.gemini_response_to_openai(response, "gemini-3-flash", {"terminal"})
         self.assertEqual(result["choices"][0]["finish_reason"], "length")
 
 

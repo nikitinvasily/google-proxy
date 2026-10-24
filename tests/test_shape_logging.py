@@ -136,7 +136,7 @@ class ShapeLoggingTests(unittest.TestCase):
         h.send_header = lambda *args: None
         h.end_headers = lambda: None
         with patch.object(proxy, 'stream_generate_content', return_value=iter([upstream])), patch.object(proxy, '_log') as log:
-            h._handle_stream(envelope, 'gemini-3.8-flash')
+            h._handle_stream(envelope, 'gemini-3-flash')
         chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines() if line.startswith('data: {')]
         line = next(c.args[0] for c in log.call_args_list if c.args[0].startswith('shape '))
         self.assertNotIn(SECRET, line)
@@ -193,7 +193,7 @@ class ShapeLoggingTests(unittest.TestCase):
             trace.observe({'response':response})
             return response
         with patch.object(proxy,'call_generate_content',side_effect=fake_call),patch.object(proxy,'_log') as log:
-            h._handle_nonstream({'request': {'tools': [],'contents':[]},'requestId':'agent-test'}, 'gemini-3.8-flash')
+            h._handle_nonstream({'request': {'tools': [],'contents':[]},'requestId':'agent-test'}, 'gemini-3-flash')
         body=json.loads(h.wfile.getvalue())
         line=next(c.args[0] for c in log.call_args_list if c.args[0].startswith('shape '))
         data=json.loads(line.split(' ',1)[1])

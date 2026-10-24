@@ -87,7 +87,7 @@ class QuotaRouteTests(unittest.TestCase):
         self.assertTrue(request.full_url.endswith('/v1internal:retrieveUserQuotaSummary'))
         self.assertEqual(json.loads(request.data), {'project': proxy.get_project_id()})
         self.assertEqual(request.get_header('Authorization'), 'Bearer synthetic-token')
-        self.assertEqual(request.get_header('User-agent'), 'antigravity/cli/1.4.6')
+        self.assertEqual(request.get_header('User-agent'), 'antigravity/cli/1.4.7')
         self.assertNotIn('private-marker', handler.wfile.getvalue().decode())
 
     def test_partial_summary_does_not_claim_complete_quotas(self):

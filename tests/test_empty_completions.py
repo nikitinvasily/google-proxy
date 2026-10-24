@@ -23,7 +23,7 @@ class EmptyCompletionTests(unittest.TestCase):
         h.send_header = lambda *args: None
         h.end_headers = lambda: None
         with patch.object(proxy, 'call_generate_content', return_value=response):
-            h._handle_nonstream(envelope, 'gemini-3.8-flash')
+            h._handle_nonstream(envelope, 'gemini-3-flash')
         self.assertEqual(statuses, [200])
         self.assertEqual(json.loads(h.wfile.getvalue().decode())['choices'][0]['message']['content'], '(empty)')
 
@@ -37,7 +37,7 @@ class EmptyCompletionTests(unittest.TestCase):
         events = iter([{'response': {'candidates': [{'content': {'parts': [{'text': '(em'}]}}]}},
                        {'response': {'candidates': [{'content': {'parts': [{'text': 'pty)'}]}, 'finishReason': 'STOP'}]}}])
         with patch.object(proxy, 'stream_generate_content', return_value=events):
-            h._handle_stream(envelope, 'gemini-3.8-flash')
+            h._handle_stream(envelope, 'gemini-3-flash')
         chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines() if line.startswith('data: {')]
         text = ''.join((c['choices'][0]['delta'].get('content') or '') for c in chunks)
         self.assertEqual(text, '(empty)')
@@ -52,7 +52,7 @@ class EmptyCompletionTests(unittest.TestCase):
         h.send_header = lambda *args: None
         h.end_headers = lambda: None
         with patch.object(proxy, 'call_generate_content', return_value=response):
-            h._handle_nonstream({'request': {'contents': [{'role': 'user', 'parts': [{'text': 'Reply with (empty)'}]}]}}, 'gemini-3.8-flash')
+            h._handle_nonstream({'request': {'contents': [{'role': 'user', 'parts': [{'text': 'Reply with (empty)'}]}]}}, 'gemini-3-flash')
         self.assertEqual(statuses, [200])
         self.assertEqual(json.loads(h.wfile.getvalue().decode())['choices'][0]['message']['content'], '(empty)')
 
@@ -65,7 +65,7 @@ class EmptyCompletionTests(unittest.TestCase):
         h.end_headers = lambda: None
         response = {'candidates': [{'content': {'parts': [{'text': '  \n'}]}, 'finishReason': 'STOP'}]}
         with patch.object(proxy, 'call_generate_content', return_value=response):
-            h._handle_nonstream({'request': {'contents': []}}, 'gemini-3.8-flash')
+            h._handle_nonstream({'request': {'contents': []}}, 'gemini-3-flash')
         self.assertEqual(statuses, [502])
 
     def test_stream_whitespace_only_is_not_success(self):
@@ -77,7 +77,7 @@ class EmptyCompletionTests(unittest.TestCase):
         events = iter([{'response': {'candidates': [{'content': {'parts': [{'text': '   '}]}}]}},
                        {'response': {'candidates': [{'content': {'parts': [{'text': '\n'}]}, 'finishReason': 'STOP'}]}}])
         with patch.object(proxy, 'stream_generate_content', return_value=events):
-            h._handle_stream({'request': {'contents': [], 'tools': []}}, 'gemini-3.8-flash')
+            h._handle_stream({'request': {'contents': [], 'tools': []}}, 'gemini-3-flash')
         chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines() if line.startswith('data: {')]
         self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'length')
 
@@ -89,7 +89,7 @@ class EmptyCompletionTests(unittest.TestCase):
         h.send_header = lambda *args: None
         h.end_headers = lambda: None
         with patch.object(proxy, 'call_generate_content', return_value=EMPTY_STOP):
-            h._handle_nonstream({'request': {'contents': []}}, 'gemini-3.8-flash')
+            h._handle_nonstream({'request': {'contents': []}}, 'gemini-3-flash')
         self.assertEqual(status, [502])
         self.assertIn('upstream', h.wfile.getvalue().decode().lower())
 
@@ -102,7 +102,7 @@ class EmptyCompletionTests(unittest.TestCase):
         events = iter([{'response': {'candidates': [{'content': {'parts': [{'text': '', 'thought': True}]}}]}},
                        {'response': EMPTY_STOP}])
         with patch.object(proxy, 'stream_generate_content', return_value=events):
-            h._handle_stream({'request': {'contents': [], 'tools': []}}, 'gemini-3.8-flash')
+            h._handle_stream({'request': {'contents': [], 'tools': []}}, 'gemini-3-flash')
         chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines() if line.startswith('data: {')]
         self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'length')
         self.assertTrue(any('empty' in (c['choices'][0]['delta'].get('content') or '').lower() for c in chunks))
@@ -116,7 +116,7 @@ class EmptyCompletionTests(unittest.TestCase):
         h.send_header = lambda *args: None
         h.end_headers = lambda: None
         with patch.object(proxy, 'call_generate_content', return_value=response):
-            h._handle_nonstream({'request': {'tools': [{'functionDeclarations': [{'name': 'lookup'}]}]}}, 'gemini-3.8-flash')
+            h._handle_nonstream({'request': {'tools': [{'functionDeclarations': [{'name': 'lookup'}]}]}}, 'gemini-3-flash')
         self.assertEqual(status, [200])
         choice = json.loads(h.wfile.getvalue().decode())['choices'][0]
         self.assertEqual(choice['finish_reason'], 'tool_calls')

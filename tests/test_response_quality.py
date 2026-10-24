@@ -13,7 +13,7 @@ class ResponseQualityTests(unittest.TestCase):
 
     def test_nonstream_thought_text_is_private(self):
         response = {"candidates": [{"content": {"parts": [{"thought": True, "text": "PRIVATE_THOUGHT"}, {"text": "public"}]}, "finishReason": "STOP"}]}
-        result = proxy.gemini_response_to_openai(response, "gemini-3.8-flash")
+        result = proxy.gemini_response_to_openai(response, "gemini-3-flash")
         self.assertEqual(result["choices"][0]["message"]["content"], "public")
 
     def test_stream_thought_text_is_private(self):
