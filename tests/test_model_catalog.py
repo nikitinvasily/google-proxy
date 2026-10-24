@@ -47,6 +47,9 @@ class ModelCatalogTests(unittest.TestCase):
             'claude-opus-5-5-low': {'displayName': 'Claude Opus 5.5'},
             'gpt-oss-120b-medium': {'displayName': 'GPT-OSS 120B'},
             'gemini-3-flash': {},
+            'gemini-4-argon-low': {},
+            'gemini-4-argon-medium': {},
+            'gemini-4-argon-high': {},
             'gemini-3.1-flash-image': {'supportsImages': True},
             'chat_20706': {'isInternal': True},
             'tab_flash_lite_preview': {'isInternal': True},
@@ -59,7 +62,8 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(handler.statuses, [200])
         self.assertEqual([item['id'] for item in body['data']], [
             'claude-opus-5-5-low', 'claude-sonnet-5-5-high',
-            'gemini-3-flash', 'gpt-oss-120b-medium',
+            'gemini-3-flash', 'gemini-4-argon-high', 'gemini-4-argon-low',
+            'gemini-4-argon-medium', 'gpt-oss-120b-medium',
         ])
         self.assertEqual(fetch.call_count, 1)
         request = fetch.call_args.args[0]
@@ -67,7 +71,7 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertTrue(request.full_url.endswith('/v1internal:fetchAvailableModels'))
         self.assertEqual(json.loads(request.data), {'project': proxy.get_project_id()})
         self.assertEqual(request.get_header('Authorization'), 'Bearer synthetic-token')
-        self.assertEqual(request.get_header('User-agent'), proxy.ANTIGRAVITY_USER_AGENT)
+        self.assertEqual(request.get_header('User-agent'), 'antigravity/cli/1.4.7')
         self.assertNotIn('private-marker', handler.wfile.getvalue().decode())
 
     def test_model_picker_reuses_recent_catalog_then_refreshes(self):

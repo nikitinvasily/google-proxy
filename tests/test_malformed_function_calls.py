@@ -36,7 +36,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
             {"response": MALFORMED},
         ])
         with patch.object(proxy, "stream_generate_content", return_value=events):
-            h._handle_stream(ENVELOPE, "gemini-3.8-flash")
+            h._handle_stream(ENVELOPE, "gemini-3-flash")
         payload = h.wfile.getvalue().decode()
         self.assertEqual(h.statuses, [200])
         self.assertIn("event: error\n", payload)
@@ -51,7 +51,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
         response = {"candidates": [{"content": {"parts": [{"text": "internal thought", "thought": True}]},
                                    "stopReason": "MALFORMED_FUNCTION_CALL"}]}
         with patch.object(proxy, "stream_generate_content", return_value=iter([{"response": response}])):
-            h._handle_stream(ENVELOPE, "gemini-3.8-flash")
+            h._handle_stream(ENVELOPE, "gemini-3-flash")
         payload = h.wfile.getvalue().decode()
         self.assertIn("event: error\n", payload)
         self.assertNotIn("data: [DONE]", payload)
@@ -60,7 +60,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
         h = handler()
         response = {"candidates": [{"content": {"parts": [{"text": "partial output"}]}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}
         with patch.object(proxy, "call_generate_content", return_value=response):
-            h._handle_nonstream(ENVELOPE, "gemini-3.8-flash")
+            h._handle_nonstream(ENVELOPE, "gemini-3-flash")
         self.assertEqual(h.statuses, [502])
         result = json.loads(h.wfile.getvalue())
         self.assertEqual(result["error"]["code"], "upstream_malformed_function_call")
@@ -72,7 +72,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
             {"text": "partial output"}, {"functionCall": "bad-shape"},
         ]}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}
         with patch.object(proxy, "call_generate_content", return_value=response):
-            h._handle_nonstream(ENVELOPE, "gemini-3.8-flash")
+            h._handle_nonstream(ENVELOPE, "gemini-3-flash")
         self.assertEqual(h.statuses, [502])
         self.assertEqual(json.loads(h.wfile.getvalue())["error"]["code"],
                          "upstream_malformed_function_call")
@@ -85,7 +85,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
         with patch.object(proxy, "stream_generate_content", return_value=iter([
             {"response": MALFORMED}, {"response": later_stop},
         ])):
-            h._handle_nonstream(ENVELOPE, "gemini-3.8-flash")
+            h._handle_nonstream(ENVELOPE, "gemini-3-flash")
         self.assertEqual(h.statuses, [502])
         self.assertEqual(json.loads(h.wfile.getvalue())["error"]["code"],
                          "upstream_malformed_function_call")
@@ -99,7 +99,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
             {"functionCall": {"name": "lookup", "args": {"value": "private-marker"}}}
         ]}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}
         with patch.object(proxy, "stream_generate_content", return_value=iter([{"response": malformed}])):
-            h._handle_stream(envelope, "gemini-3.8-flash")
+            h._handle_stream(envelope, "gemini-3-flash")
         payload = h.wfile.getvalue().decode()
         self.assertIn("event: error\n", payload)
         self.assertNotIn('"tool_calls"', payload)
@@ -113,7 +113,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
             {"content": {"parts": []}, "finishReason": "MALFORMED_FUNCTION_CALL"},
         ]}
         with patch.object(proxy, "stream_generate_content", return_value=iter([{"response": response}])):
-            h._handle_stream(ENVELOPE, "gemini-3.8-flash")
+            h._handle_stream(ENVELOPE, "gemini-3-flash")
         payload = h.wfile.getvalue().decode()
         self.assertIn("event: error\n", payload)
         self.assertNotIn("do not send", payload)
@@ -161,7 +161,7 @@ class MalformedFunctionCallTests(unittest.TestCase):
                 client = OpenAI(api_key="test-only", base_url=f"http://127.0.0.1:{server.server_port}/v1",
                                 max_retries=0, timeout=5)
                 with self.assertRaises(APIError) as caught:
-                    list(client.chat.completions.create(model="gemini-3.8-flash", stream=True,
+                    list(client.chat.completions.create(model="gemini-3-flash", stream=True,
                                                         messages=[{"role": "user", "content": "test"}]))
                 self.assertIn("invalid function call", str(caught.exception))
         finally:

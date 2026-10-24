@@ -39,7 +39,7 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Google 
 - **OpenAI-compatible** `POST /v1/chat/completions` — streaming + non-streaming
 - **Native Gemini passthrough** `POST /v1beta/models/{model}:generateContent` — text-only structured JSON output
 - **Tool/function calling** — OpenAI tools format → Gemini functionDeclarations, with round-trip encoding
-- **Model discovery** — lists current upstream text models; legacy aliases still work for existing clients
+- **Model discovery** — lists current upstream text models; model IDs are sent upstream unchanged
 - **OAuth token auto-refresh** — token refreshed automatically when expired, no manual intervention
 - **Zero pip dependencies** — Python 3.10+ standard library only
 - **systemd service** included — run as a background service on Linux
@@ -48,9 +48,9 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Google 
 
 ## Available Models
 
-Run `curl http://127.0.0.1:8877/v1/models` and use a returned `id` in your client. `/models` is an alias. The proxy asks Antigravity for the current catalog using the same client identity as generation, caches it for five minutes, and excludes internal and image-only entries. If Google does not return a usable catalog, the endpoint reports an error instead of showing an outdated list. Access and quotas can still vary per model; a listed ID does not guarantee capacity. GPT-OSS is an open-weight model, not a claim that proprietary OpenAI GPT models are available.
+Run `curl http://127.0.0.1:8877/v1/models` and use a returned `id` in your client. `/models` is an alias. The proxy uses the `agy` CLI User-Agent for catalog, generation, and quota requests, caches the catalog for five minutes, and excludes internal and image-only entries. The CLI catalog can include subscription-only models such as `gemini-4-argon-high`, `gemini-4-argon-medium`, and `gemini-4-argon-low` that the Electron catalog omits. If Google does not return a usable catalog, the endpoint reports an error instead of showing an outdated list. Access and quotas can still vary per model; a listed ID does not prove generation works. GPT-OSS is an open-weight model, not a claim that proprietary OpenAI GPT models are available.
 
-`MODEL_MAP` still translates old aliases used by existing clients, but those aliases are **not** advertised in `/v1/models` and may point to models Google has removed.
+Use the exact model ID returned by `/v1/models`. The proxy does not silently remap old names such as `gemini-3.8-flash` to another model; an unsupported ID may be rejected by Google.
 
 ---
 
@@ -229,8 +229,15 @@ systemctl --user status antigravity-proxy
 |------------------------------|---------|------------------------------------|
 | `ANTIGRAVITY_CLIENT_ID`      | built-in| Override OAuth client ID           |
 | `ANTIGRAVITY_CLIENT_SECRET`  | built-in| Override OAuth client secret       |
+| `ANTIGRAVITY_CAPTURE_UPSTREAM_ERRORS` | unset | Set to `1` temporarily to retain upstream model-generation HTTP error bodies for debugging |
 
 The default client credentials are the same values embedded in every Antigravity CLI binary — you only need these env vars if you're using a custom build.
+
+### Temporary upstream error capture
+
+Set `ANTIGRAVITY_CAPTURE_UPSTREAM_ERRORS=1` in the proxy service environment and restart **the proxy only**. On an upstream HTTP error during model generation, the proxy saves up to 8 KiB of the response body, the HTTP status, a bounded model ID, timestamp, and truncation flag under `~/.hermes/cache/proxy-upstream-errors/`. The directory is private (`0700`) and each file is `0600`. The proxy does not copy its request or OAuth headers into the diagnostic, and the upstream body is never written to `proxy.log`, the journal, or the client error. The journal contains only a filename to locate the diagnostic.
+
+Upstream error messages **may quote private user content or credentials**, even though the proxy never adds them to the file itself. Do not attach these files to bug reports or commit them. A single proxy process retains at most 50 diagnostics and prunes files older than 24 hours **when the next error is captured**. Remove the files and unset the environment variable when debugging is finished.
 
 ---
 
@@ -322,7 +329,7 @@ Antigravity Proxy (localhost:8877)
     │  ┌─ Translates OpenAI messages → Gemini contents
     │  ├─ Converts OpenAI tools → Gemini functionDeclarations
     │  ├─ Manages OAuth token (auto-refresh)
-    │  ├─ Preserves live model IDs or translates legacy aliases
+    │  ├─ Forwards live model IDs unchanged (no legacy aliases)
     │  └─ Wraps in Antigravity envelope {project, model, request}
     │
     ▼
@@ -349,7 +356,7 @@ Gemini / Claude / GPT-OSS models → Response unwrapped → OpenAI format → Yo
 
 ## Adding or Updating Models
 
-You do not need to edit code when Google changes its model catalog: `GET /v1/models` fetches live IDs. `MODEL_MAP` in `antigravity_proxy.py` is only for optional aliases used in requests. Adding an alias does not add it to the advertised catalog. Restart the proxy if you edit aliases.
+You do not need to edit code when Google changes its model catalog: `GET /v1/models` fetches live IDs. Configure clients with one of those exact IDs; the proxy forwards it unchanged.
 
 ---
 

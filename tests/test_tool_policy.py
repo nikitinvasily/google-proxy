@@ -16,10 +16,10 @@ def stream(events, tools=("terminal",), choice="auto"):
     handler.send_response = lambda *args: None
     handler.send_header = lambda *args: None
     handler.end_headers = lambda *args: None
-    body = {"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "hello"}], "tools": [TOOL(name) for name in tools], "tool_choice": choice}
+    body = {"model": "gemini-3-flash", "messages": [{"role": "user", "content": "hello"}], "tools": [TOOL(name) for name in tools], "tool_choice": choice}
     envelope = proxy._build_gemini_request(body, "gemini-3-flash")
     with patch.object(proxy, "stream_generate_content", return_value=iter(events)):
-        handler._handle_stream(envelope, "gemini-3.8-flash")
+        handler._handle_stream(envelope, "gemini-3-flash")
     return [json.loads(line[6:]) for line in handler.wfile.getvalue().decode().splitlines() if line.startswith("data: {")]
 
 
@@ -28,7 +28,7 @@ class ToolPolicyTests(unittest.TestCase):
         envelope = proxy._build_gemini_request({"messages": [{"role": "user", "content": "hello"}], "tools": [TOOL("terminal")], "tool_choice": "none"}, "gemini-3-flash")
         allowed = proxy._declared_tool_names(envelope)
         response = {"candidates": [{"content": {"parts": [{"text": "call:default_api:terminal{command:pwd}"}]}, "finishReason": "STOP"}]}
-        result = proxy.gemini_response_to_openai(response, "gemini-3.8-flash", allowed)["choices"][0]
+        result = proxy.gemini_response_to_openai(response, "gemini-3-flash", allowed)["choices"][0]
         self.assertEqual(result["finish_reason"], "stop")
         self.assertNotIn("tool_calls", result["message"])
 

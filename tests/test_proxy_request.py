@@ -11,7 +11,7 @@ class RequestConversionTests(unittest.TestCase):
     def build(self, messages):
         with patch.object(proxy, "get_project_id", return_value="test-project"):
             envelope = proxy._build_gemini_request(
-                {"model": "gemini-3.8-flash", "messages": messages}, "gemini-3-flash"
+                {"model": "gemini-3-flash", "messages": messages}, "gemini-3-flash"
             )
         return envelope["request"]
 
