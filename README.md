@@ -52,6 +52,8 @@ Run `curl http://127.0.0.1:8877/v1/models` and use a returned `id` in your clien
 
 Use the exact model ID returned by `/v1/models`. The proxy does not silently remap old names such as `gemini-3.8-flash` to another model; an unsupported ID may be rejected by Google.
 
+When Google supplies `maxTokens` and `maxOutputTokens`, `/v1/models` exposes them as `context_length` and `max_output_tokens` for each model. Missing or invalid limits are omitted rather than guessed. For Gemini chat requests, the proxy asks for available thought summaries (`includeThoughts`) and sends readable `thought: true` text as `reasoning_content` in both ordinary and streamed OpenAI responses. The final answer stays in `content`; opaque `thoughtSignature` remains separate and is only used to replay tool calls. Other model families are not forced into Gemini's thinking configuration. A model may return no readable thoughts even when requested.
+
 ---
 
 ## Quick Start

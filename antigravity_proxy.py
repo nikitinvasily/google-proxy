@@ -71,7 +71,7 @@ RETRIEVE_USER_QUOTA_SUMMARY_URL = f"{CLOUDCODE_BASE}/v1internal:retrieveUserQuot
 FETCH_AVAILABLE_MODELS_URL = f"{CLOUDCODE_BASE}/v1internal:fetchAvailableModels"
 MODEL_CATALOG_TTL = 300
 _models_cache_lock = threading.Lock()
-_models_cache_ids = None
+_models_cache_ids: list[dict] | None = None
 _models_cache_until = 0.0
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
@@ -468,8 +468,8 @@ def fetch_quota_groups(access_token: str) -> list[dict]:
         raise ValueError("Quota summary has no measured buckets")
     return groups
 
-def fetch_available_models(access_token: str) -> list[str]:
-    """List text-capable models from the same backend used for generation."""
+def fetch_available_models(access_token: str) -> list[dict]:
+    """List text-capable models and validated limits from the generation backend."""
     req = Request(FETCH_AVAILABLE_MODELS_URL,
                   data=json.dumps({"project": get_project_id()}).encode(), method="POST")
     req.add_header("Authorization", f"Bearer {access_token}")
@@ -499,7 +499,7 @@ def fetch_available_models(access_token: str) -> list[str]:
             remaining.extend(item.values())
         elif isinstance(item, list):
             remaining.extend(item)
-    model_ids = []
+    model_entries = []
     for model_id, info in payload["models"].items():
         if (not isinstance(model_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,127}", model_id)
@@ -509,21 +509,27 @@ def fetch_available_models(access_token: str) -> list[str]:
                     and not model_id.startswith(("gemini-", "claude-", "gpt-")))
                 or "-image" in model_id):
             continue
-        model_ids.append(model_id)
-    if not model_ids:
+        entry: dict = {"id": model_id}
+        for upstream_key, published_key in (("maxTokens", "context_length"),
+                                            ("maxOutputTokens", "max_output_tokens")):
+            value = info.get(upstream_key)
+            if type(value) is int and value > 0:
+                entry[published_key] = value
+        model_entries.append(entry)
+    if not model_entries:
         raise ValueError("Model catalog has no supported text models")
-    return sorted(model_ids)
+    return sorted(model_entries, key=lambda entry: entry["id"])
 
-def get_available_models(access_token: str) -> list[str]:
+def get_available_models(access_token: str) -> list[dict]:
     """Share one short-lived catalog between concurrent model picker requests."""
     global _models_cache_ids, _models_cache_until
     with _models_cache_lock:
         if _models_cache_ids is not None and time.monotonic() < _models_cache_until:
-            return list(_models_cache_ids)
-        model_ids = fetch_available_models(access_token)
-        _models_cache_ids = model_ids
+            return [entry.copy() for entry in _models_cache_ids]
+        model_entries = fetch_available_models(access_token)
+        _models_cache_ids = model_entries
         _models_cache_until = time.monotonic() + MODEL_CATALOG_TTL
-        return list(model_ids)
+        return [entry.copy() for entry in model_entries]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OpenAI -> Gemini message transformation
@@ -1002,6 +1008,8 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
         gen_config["stopSequences"] = stops
     if "seed" in body and body["seed"] is not None:
         gen_config["seed"] = int(body["seed"])
+    if backend_model.startswith("gemini-"):
+        gen_config.setdefault("thinkingConfig", {})["includeThoughts"] = True
     # Enable thinking for the thinking variant of claude-opus.
     if backend_model == "claude-opus-4-6-thinking":
         thinking_cfg = gen_config.get("thinkingConfig", {})
@@ -1084,6 +1092,13 @@ def _parse_text_tool_call(text: str, allowed_tool_names: set):
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(args)},
     }
+
+
+def _extract_thought_text(parts: list) -> str:
+    """Return only readable thought summaries, never opaque thought signatures."""
+    return "".join(part["text"] for part in parts or []
+                   if isinstance(part, dict) and part.get("thought") is True
+                   and isinstance(part.get("text"), str))
 
 
 def _extract_parts(parts: list, allowed_tool_names=None) -> tuple[str, list, str]:
@@ -1187,6 +1202,7 @@ def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=Non
     """
     candidates = response.get("candidates") or []
     text = ""
+    reasoning = ""
     tool_calls = []
     finish_reason = "stop"
 
@@ -1196,6 +1212,7 @@ def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=Non
         content = cand.get("content") or {}
         parts = content.get("parts") or []
         text, tool_calls, _ = _extract_parts(parts, allowed_tool_names)
+        reasoning = _extract_thought_text(parts)
         if tool_calls:
             finish_reason = _finish_reason_from_gemini(cand, tool_calls)
         # Assign tool call ids.
@@ -1211,6 +1228,8 @@ def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=Non
             text = f"[Content blocked: {br}]"
 
     message = {"role": "assistant", "content": text if text else None}
+    if reasoning:
+        message["reasoning_content"] = reasoning
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -1391,7 +1410,7 @@ class ShapeTrace:
             data = dict(self.data, completion_id=completion_id,
                         finish_reason=finish_reason if finish_reason in
                         ("stop", "tool_calls", "length", "content_filter", "upstream_empty_response",
-                         "upstream_malformed_function_call") else "unknown",
+                         "upstream_malformed_function_call", "upstream_transform_error") else "unknown",
                         output_tool_calls=output_tool_calls)
             _log("shape " + json.dumps(data, sort_keys=True, separators=(",", ":")))
         except Exception:
@@ -1780,7 +1799,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("auth_error", "OAuth token unavailable", http_code=401)
             return
         try:
-            model_ids = get_available_models(access_token)
+            model_entries = get_available_models(access_token)
         except HTTPError as error:
             status = error.code if 400 <= error.code <= 599 else 502
             error.close()
@@ -1791,9 +1810,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         now = int(time.time())
         models = []
-        for name in model_ids:
+        for entry in model_entries:
             models.append({
-                "id": name,
+                **entry,
                 "object": "model",
                 "created": now,
                 "owned_by": "google",
@@ -1941,24 +1960,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("upstream_malformed_function_call", str(e), http_code=e.status)
             return
         except Exception as e:
-            _log(f"Response transform error: {e}\n{traceback.format_exc()}")
-            # Fallback: return raw text if we can find any.
-            try:
-                text = (gemini_resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", ""))
-            except Exception:
-                text = ""
-            openai_resp = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text or "[error: could not parse response]"},
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
+            _log(f"Response transform error: {type(e).__name__}")
+            trace.emit(f"chatcmpl-{uuid.uuid4().hex[:24]}", "upstream_transform_error", 0)
+            self._send_error_json("upstream_transform_error", "Could not parse upstream response", http_code=502)
+            return
         choice = openai_resp["choices"][0]
         message = choice["message"]
         text = (message.get("content") or "").strip()
@@ -2077,6 +2082,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 fr = cand.get("finishReason") or cand.get("stopReason")
                 content = cand.get("content") or {}
                 parts = content.get("parts") or []
+                reasoning_delta = _extract_thought_text(parts)
 
                 # Function calls are complete snapshots, not argument deltas. Wait
                 # for finishReason so later snapshots can supply the final args or
@@ -2138,6 +2144,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                 # Build delta.
                 delta = {}
+                if reasoning_delta:
+                    delta["reasoning_content"] = reasoning_delta
                 if text_delta:
                     delta["content"] = text_delta
                 if tool_call_deltas:

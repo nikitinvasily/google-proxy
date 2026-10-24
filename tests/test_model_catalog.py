@@ -90,6 +90,32 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertEqual(fetch.call_count, 2)
         self.assertEqual([item['id'] for item in three['data']], ['gpt-oss-120b-medium'])
 
+    def test_catalog_exposes_valid_per_model_context_and_output_limits(self):
+        available = {'models': {
+            'gemini-3-flash': {'maxTokens': 1048576, 'maxOutputTokens': 65536,
+                               'privateData': 'private-marker'},
+            'gemini-4-argon-high': {'maxTokens': 524288, 'maxOutputTokens': 32768},
+            'claude-sonnet-5-5-high': {'maxTokens': True, 'maxOutputTokens': '65536'},
+            'gpt-oss-120b-medium': {'maxTokens': -1, 'maxOutputTokens': 0},
+        }}
+        with patch.dict(proxy.__dict__, {'_models_cache_ids': None, '_models_cache_until': 0.0}), \
+             patch.object(proxy, 'get_access_token', return_value='synthetic-token'), \
+             patch.object(proxy, 'urlopen', return_value=FakeResponse(available)) as fetch:
+            first, body = self.handle('/v1/models')
+            second, alias = self.handle('/models')
+        self.assertEqual(first.statuses, [200])
+        self.assertEqual(second.statuses, [200])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(alias, body)
+        by_id = {item['id']: item for item in body['data']}
+        self.assertEqual(by_id['gemini-3-flash']['context_length'], 1048576)
+        self.assertEqual(by_id['gemini-3-flash']['max_output_tokens'], 65536)
+        self.assertEqual(by_id['gemini-4-argon-high']['context_length'], 524288)
+        for model_id in ('claude-sonnet-5-5-high', 'gpt-oss-120b-medium'):
+            self.assertNotIn('context_length', by_id[model_id])
+            self.assertNotIn('max_output_tokens', by_id[model_id])
+        self.assertNotIn('private-marker', first.wfile.getvalue().decode())
+
     def test_missing_or_non_text_catalog_does_not_advertise_stale_models(self):
         for payload in ({'models': []}, {'models': {}},
                         {'models': {'gemini-3.1-flash-image': {}, 'chat_20706': {'isInternal': True}}}):
