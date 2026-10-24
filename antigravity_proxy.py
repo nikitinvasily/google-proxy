@@ -580,7 +580,8 @@ def _content_to_parts(content) -> list:
     return [{"text": s}] if s else []
 
 
-_SCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_SCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "definitions",
+                        "dependentSchemas", "dependencies")
 _SCHEMA_CHILD_KEYWORDS = ("items", "additionalProperties", "additionalItems", "contains",
                           "propertyNames", "unevaluatedProperties", "unevaluatedItems", "contentSchema")
 _SCHEMA_LIST_KEYWORDS = ("allOf", "prefixItems")
