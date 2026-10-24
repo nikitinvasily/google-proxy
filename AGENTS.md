@@ -10,7 +10,7 @@ A local proxy server that translates OpenAI-compatible API calls into Google Ant
 
 The proxy listens on `http://127.0.0.1:8877` and exposes these API endpoints:
 - `POST /v1/chat/completions` — OpenAI chat format (messages, tools, streaming)
-- `POST /v1beta/models/{model}:generateContent` — text-only Gemini passthrough (structured output; images rejected)
+- `POST /v1beta/models/{model}:generateContent` — Gemini passthrough (structured output and inline base64 images; external/file URLs rejected)
 - `GET /v1/models` (also `/models`) — live text-model catalog from Google under the agy CLI User-Agent, cached for five minutes; excludes internal and image-only entries; listing a model does not prove generation works
 - `GET /quota` (also `/v1/quota`) — live read-only model buckets and subscription groups (including separate Argon quotas when reported) directly from Google; no `agy` subprocess, token, or project ID in the response
 

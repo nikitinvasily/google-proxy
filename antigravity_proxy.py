@@ -27,6 +27,7 @@ Then configure Hermes:
 """
 
 import argparse
+import base64
 import json
 import itertools
 import os
@@ -535,18 +536,60 @@ def get_available_models(access_token: str) -> list[dict]:
 # OpenAI -> Gemini message transformation
 # ──────────────────────────────────────────────────────────────────────────────
 
+_DATA_IMAGE_URL_RE = re.compile(
+    r"^data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$"
+)
+
+
+def _parse_data_image_url(url_val) -> dict:
+    """Parse a base64 data:image/* URL into a Gemini inlineData part; reject external/file URLs."""
+    if not isinstance(url_val, str) or not url_val.strip():
+        raise ValueError("Empty image URL is not supported by this proxy")
+    match = _DATA_IMAGE_URL_RE.match(url_val.strip())
+    if not match:
+        raise ValueError("External or file image URLs are not supported by this proxy (use base64 data:image/*)")
+    mime_type = match.group(1).lower()
+    raw_b64 = re.sub(r"\s+", "", match.group(2))
+    try:
+        decoded = base64.b64decode(raw_b64, validate=True)
+    except Exception as exc:
+        raise ValueError("Invalid base64 image data") from exc
+    if not decoded:
+        raise ValueError("Empty base64 image data")
+    return {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(decoded).decode("ascii")}}
+
+
+def _validate_inline_image_dict(item: dict) -> None:
+    """Validate a native Gemini inlineData/inline_data dict (must be non-empty base64 image/*)."""
+    if not isinstance(item, dict):
+        raise ValueError("Invalid inlineData payload")
+    mime_type = str(item.get("mimeType") or item.get("mime_type") or "").strip().lower()
+    data = item.get("data")
+    if not mime_type.startswith("image/") or not isinstance(data, str) or not data.strip():
+        raise ValueError("Only base64 image/* inlineData is supported by this proxy")
+    try:
+        decoded = base64.b64decode(re.sub(r"\s+", "", data), validate=True)
+    except Exception as exc:
+        raise ValueError("Invalid base64 in inlineData") from exc
+    if not decoded:
+        raise ValueError("Empty base64 in inlineData")
+
+
 def _reject_image_data(value):
-    """Reject image/media payloads rather than fetching or forwarding them."""
+    """Allow validated inline base64 images; reject external fileData/URL media payloads."""
     if isinstance(value, dict):
         for key, item in value.items():
             if key in ("responseSchema", "response_schema"):
                 continue  # Output field names are not input media payloads.
-            media_part = key in {"inlineData", "inline_data", "fileData", "file_data", "image_url", "input_image"}
+            if key in {"inlineData", "inline_data"}:
+                _validate_inline_image_dict(item)
+                continue
+            media_part = key in {"fileData", "file_data", "image_url", "input_image"}
             image_payload = key == "image" and isinstance(item, dict) and bool(
                 {"data", "url", "mimeType", "mime_type", "fileUri"}.intersection(item)
             )
             if media_part or image_payload:
-                raise ValueError("Images are not supported by this proxy")
+                raise ValueError("External or file image URLs are not supported by this proxy")
             _reject_image_data(item)
     elif isinstance(value, list):
         for item in value:
@@ -573,7 +616,10 @@ def _content_to_parts(content) -> list:
                 if text:
                     parts.append({"text": text})
             elif btype in ("image_url", "input_image", "image"):
-                raise ValueError("Images are not supported by this proxy")
+                raw_url = block.get("image_url") or block.get("image") or block.get("url")
+                if isinstance(raw_url, dict):
+                    raw_url = raw_url.get("url")
+                parts.append(_parse_data_image_url(raw_url))
             elif btype == "input_text":
                 text = block.get("text", "")
                 if text:
@@ -839,11 +885,14 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
         if role in ("tool", "function"):
             # OpenAI tool result message -> Gemini functionResponse part with role: 'user'.
             tool_call_id = msg.get("tool_call_id", "")
-            # tool content handled as text
+            # tool content handled as text + optional inlineData image parts
             content_text = ""
+            extra_parts = []
             for p in _content_to_parts(msg.get("content")):
                 if "text" in p:
                     content_text += p["text"]
+                elif "inlineData" in p:
+                    extra_parts.append(p)
             # Try to parse JSON from the tool result; Gemini wants an object.
             response_obj = {}
             if content_text:
@@ -876,7 +925,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
                 func_resp["id"] = fc_response_id
             contents.append({
                 "role": "user",
-                "parts": [{"functionResponse": func_resp}],
+                "parts": [{"functionResponse": func_resp}, *extra_parts],
             })
             continue
 
