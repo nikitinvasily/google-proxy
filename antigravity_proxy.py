@@ -560,13 +560,13 @@ def _parse_data_image_url(url_val) -> dict:
 
 
 def _validate_inline_image_dict(item: dict) -> None:
-    """Validate a native Gemini inlineData/inline_data dict (must be non-empty base64 image/*)."""
+    """Validate a native Gemini inlineData/inline_data dict (must be non-empty base64 image/* or audio/*)."""
     if not isinstance(item, dict):
         raise ValueError("Invalid inlineData payload")
     mime_type = str(item.get("mimeType") or item.get("mime_type") or "").strip().lower()
     data = item.get("data")
-    if not mime_type.startswith("image/") or not isinstance(data, str) or not data.strip():
-        raise ValueError("Only base64 image/* inlineData is supported by this proxy")
+    if not mime_type.startswith(("image/", "audio/")) or not isinstance(data, str) or not data.strip():
+        raise ValueError("Only base64 image/* or audio/* inlineData is supported by this proxy")
     try:
         decoded = base64.b64decode(re.sub(r"\s+", "", data), validate=True)
     except Exception as exc:
@@ -620,6 +620,32 @@ def _content_to_parts(content) -> list:
                 if isinstance(raw_url, dict):
                     raw_url = raw_url.get("url")
                 parts.append(_parse_data_image_url(raw_url))
+            elif btype == "input_audio":
+                audio_info = block.get("input_audio") or {}
+                if not isinstance(audio_info, dict):
+                    raise ValueError("Invalid input_audio block")
+                raw_b64 = re.sub(r"\s+", "", str(audio_info.get("data") or ""))
+                fmt = str(audio_info.get("format") or "wav").strip().lower()
+                mime_map = {
+                    "wav": "audio/wav",
+                    "mp3": "audio/mp3",
+                    "ogg": "audio/ogg",
+                    "oga": "audio/ogg",
+                    "opus": "audio/ogg",
+                    "m4a": "audio/mp4",
+                    "mp4": "audio/mp4",
+                    "webm": "audio/webm",
+                    "flac": "audio/flac",
+                    "aac": "audio/aac",
+                }
+                mime_type = mime_map.get(fmt, f"audio/{fmt}")
+                try:
+                    decoded = base64.b64decode(raw_b64, validate=True)
+                except Exception as exc:
+                    raise ValueError("Invalid base64 audio data") from exc
+                if not decoded:
+                    raise ValueError("Empty base64 audio data")
+                parts.append({"inlineData": {"mimeType": mime_type, "data": base64.b64encode(decoded).decode("ascii")}})
             elif btype == "input_text":
                 text = block.get("text", "")
                 if text:
@@ -1901,6 +1927,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat()
                 self._log_req("POST", path, getattr(self, "_response_status", 200), time.time() - t0)
+            elif path in ("/v1/audio/transcriptions", "/audio/transcriptions"):
+                self._handle_audio_transcriptions()
+                self._log_req("POST", path, getattr(self, "_response_status", 200), time.time() - t0)
             elif _GEMINI_PASSTHROUGH_RE.match(path):
                 self._handle_gemini_passthrough(path)
                 self._log_req("POST", path, getattr(self, "_response_status", 200), time.time() - t0)
@@ -1917,6 +1946,136 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _log_req(self, method, path, status, duration):
         _log(f"{method} {path} {status} {duration:.3f}s")
+
+    # ── Audio transcriptions (OpenAI Whisper multipart -> Gemini inlineData) ──
+
+    def _handle_audio_transcriptions(self):
+        from email.parser import BytesParser
+        from email.policy import default as email_default_policy
+
+        content_type = self.headers.get("Content-Type", "")
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0 or length > 26_214_400:
+            self._send_error_json("invalid_request", "Invalid or oversized audio payload", err_type="invalid_request_error", http_code=400)
+            return
+        if "multipart/form-data" not in content_type.lower():
+            self._send_error_json("invalid_request", "Expected multipart/form-data", err_type="invalid_request_error", http_code=400)
+            return
+
+        raw_body = self.rfile.read(length)
+        mime_msg = BytesParser(policy=email_default_policy).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw_body
+        )
+
+        fields = {}
+        file_bytes = None
+        filename = "audio.wav"
+        part_ct = ""
+        for part in mime_msg.iter_parts():
+            disp = part.get("Content-Disposition", "")
+            if "form-data" not in disp:
+                continue
+            name = part.get_param("name", header="content-disposition")
+            fn = part.get_param("filename", header="content-disposition")
+            raw_payload = part.get_payload(decode=True)
+            payload = bytes(raw_payload) if isinstance(raw_payload, (bytes, bytearray, memoryview)) else b""
+            if name == "file" or fn is not None:
+                file_bytes = payload
+                if fn:
+                    filename = str(fn)
+                part_ct = (part.get_content_type() or "").lower()
+            elif name:
+                fields[str(name)] = payload.decode("utf-8", errors="replace").strip()
+
+        if not file_bytes:
+            self._send_error_json("invalid_request", "Missing 'file' in multipart form", err_type="invalid_request_error", http_code=400)
+            return
+
+        ext = os.path.splitext(filename)[1].lstrip(".").lower()
+        ext_mime = {
+            "wav": "audio/wav",
+            "mp3": "audio/mp3",
+            "ogg": "audio/ogg",
+            "oga": "audio/ogg",
+            "opus": "audio/ogg",
+            "m4a": "audio/mp4",
+            "mp4": "audio/mp4",
+            "webm": "audio/webm",
+            "flac": "audio/flac",
+            "aac": "audio/aac",
+        }
+        mime_type = ext_mime.get(ext) or (part_ct if part_ct.startswith("audio/") else "audio/wav")
+
+        req_model = fields.get("model", "").strip()
+        if not req_model or req_model.startswith("whisper") or req_model.startswith("gpt-"):
+            target_model = "gemini-3.8-flash-low"
+        else:
+            target_model = req_model.split("/", 1)[-1] if "/" in req_model else req_model
+
+        language = fields.get("language", "").strip()
+        prompt_hint = fields.get("prompt", "").strip()
+        response_format = fields.get("response_format", "json").strip().lower()
+
+        instruction = (
+            "Transcribe this audio recording verbatim. Output ONLY the exact spoken words "
+            "without any commentary, markdown formatting, quotes, or prefixes. "
+            "If the audio contains only silence or noise with no speech, output nothing."
+        )
+        if language:
+            instruction += f" Language hint: {language}."
+        if prompt_hint:
+            instruction += f" Vocabulary/context hint: {prompt_hint}."
+
+        envelope = {
+            "project": get_project_id(),
+            "model": target_model,
+            "request": {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": instruction},
+                            {
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": base64.b64encode(file_bytes).decode("ascii"),
+                                }
+                            },
+                        ],
+                    }
+                ],
+                "generationConfig": {"temperature": 0.0},
+            },
+            "requestType": "agent",
+            "userAgent": "antigravity",
+            "requestId": f"agent-{uuid.uuid4()}",
+        }
+
+        try:
+            gemini_resp = call_generate_content(envelope)
+        except UpstreamError as e:
+            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
+            return
+        except Exception as e:
+            self._send_error_json("upstream_error", f"Upstream call failed: {e}", err_type="api_error", http_code=502)
+            return
+
+        candidates = gemini_resp.get("candidates") or []
+        parts = (candidates[0].get("content") or {}).get("parts") or [] if candidates else []
+        transcript = "".join(
+            p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p and not p.get("thought")
+        ).strip()
+
+        if response_format == "text":
+            self._response_status = 200
+            body = transcript.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self._send_json(200, {"text": transcript})
 
     # ── Chat completions ──────────────────────────────────────────────────────
 

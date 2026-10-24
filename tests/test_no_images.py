@@ -18,6 +18,8 @@ class NoImagesTests(unittest.TestCase):
         self.assertEqual(parts, [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}])
         parts2 = proxy._content_to_parts([{"type": "input_image", "image_url": "data:image/jpeg;base64,AA=="}])
         self.assertEqual(parts2, [{"inlineData": {"mimeType": "image/jpeg", "data": "AA=="}}])
+        parts3 = proxy._content_to_parts([{"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}])
+        self.assertEqual(parts3, [{"inlineData": {"mimeType": "audio/wav", "data": "AA=="}}])
 
     def test_native_inline_data_is_accepted_when_valid_base64_image(self):
         env = proxy._build_passthrough_envelope(
