@@ -105,6 +105,20 @@ class ClaudeToolSchemaTests(unittest.TestCase):
         self.assertEqual(result["properties"]["literal"],
                          self.schema["properties"]["literal"])
 
+    def test_claude_rewrites_schema_dependencies_but_keeps_required_lists(self):
+        union = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        self.schema["properties"]["guarded"] = {
+            "type": "object",
+            "dependencies": {"mode": union, "kind": ["mode"]},
+            "not": {"dependencies": {"mode": union}},
+        }
+        original = copy.deepcopy(self.schema)
+        result = self.build("claude-sonnet-5-5-medium")["properties"]["guarded"]
+        self.assertEqual(result["dependencies"]["mode"], {})
+        self.assertEqual(result["dependencies"]["kind"], ["mode"])
+        self.assertNotIn("not", result)
+        self.assertEqual(self.schema, original)
+
     def test_gemini_keeps_original_union_schema(self):
         self.assertEqual(self.build("gemini-3-flash"), self.schema)
 
