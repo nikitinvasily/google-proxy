@@ -1264,11 +1264,18 @@ def _extract_usage(response: dict) -> dict:
     pt = usage.get("promptTokenCount", 0) or 0
     ct = usage.get("candidatesTokenCount", 0) or usage.get("completionTokenCount", 0) or 0
     tt = usage.get("totalTokenCount", (pt + ct)) or (pt + ct)
-    return {
+    cached = usage.get("cachedContentTokenCount", 0) or 0
+    thoughts = usage.get("thoughtsTokenCount", 0) or 0
+    res = {
         "prompt_tokens": pt,
         "completion_tokens": ct,
         "total_tokens": tt,
     }
+    if cached:
+        res["prompt_tokens_details"] = {"cached_tokens": cached}
+    if thoughts:
+        res["completion_tokens_details"] = {"reasoning_tokens": thoughts}
+    return res
 
 
 def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=None) -> dict:
@@ -1519,6 +1526,9 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
     last_finish_reason = None
     total_prompt_tokens = 0
     total_candidates_tokens = 0
+    total_cached_tokens = 0
+    total_thoughts_tokens = 0
+    total_tokens_reported = 0
     model_version = ""
     prompt_feedback = None
 
@@ -1547,16 +1557,34 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
                 last_finish_reason = reason
         if resp.get("modelVersion"):
             model_version = resp.get("modelVersion")
-        um = resp.get("usageMetadata") or {}
-        if um.get("promptTokenCount"):
-            total_prompt_tokens = um.get("promptTokenCount")
-        if um.get("candidatesTokenCount"):
-            total_candidates_tokens = um.get("candidatesTokenCount")
+        um = resp.get("usageMetadata")
+        if isinstance(um, dict):
+            if um.get("promptTokenCount"):
+                total_prompt_tokens = um.get("promptTokenCount")
+            if um.get("candidatesTokenCount"):
+                total_candidates_tokens = um.get("candidatesTokenCount")
+            if um.get("cachedContentTokenCount"):
+                total_cached_tokens = um.get("cachedContentTokenCount")
+            if um.get("thoughtsTokenCount"):
+                total_thoughts_tokens = um.get("thoughtsTokenCount")
+            if um.get("totalTokenCount"):
+                total_tokens_reported = um.get("totalTokenCount")
 
     if not last_finish_reason and not (prompt_feedback or {}).get("blockReason"):
         raise UpstreamError("Upstream stream ended without finishReason", status=502)
     total_prompt = total_prompt_tokens or 0
     total_candidates = total_candidates_tokens or 0
+    cached_val = total_cached_tokens or 0
+    thoughts_val = total_thoughts_tokens or 0
+    usage_metadata = {
+        "promptTokenCount": total_prompt,
+        "candidatesTokenCount": total_candidates,
+        "totalTokenCount": total_tokens_reported or (total_prompt + total_candidates),
+    }
+    if cached_val > 0:
+        usage_metadata["cachedContentTokenCount"] = cached_val
+    if thoughts_val > 0:
+        usage_metadata["thoughtsTokenCount"] = thoughts_val
     resp_dict = {
         "candidates": ([{
             "content": {"role": "model", "parts": combined_parts},
@@ -1564,11 +1592,7 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
         }] if last_finish_reason else []),
         "promptFeedback": prompt_feedback or {},
         "modelVersion": model_version,
-        "usageMetadata": {
-            "promptTokenCount": total_prompt,
-            "candidatesTokenCount": total_candidates,
-            "totalTokenCount": total_prompt + total_candidates,
-        }
+        "usageMetadata": usage_metadata,
     }
     return resp_dict
 
@@ -2437,14 +2461,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Include usage in the final chunk if the client requested
             # stream_options.include_usage (OpenAI convention).
             if total_usage:
-                pt = total_usage.get("promptTokenCount", 0) or 0
-                ct = total_usage.get("candidatesTokenCount", 0) or total_usage.get("completionTokenCount", 0) or 0
-                tt = total_usage.get("totalTokenCount", (pt + ct)) or (pt + ct)
-                final_chunk["usage"] = {
-                    "prompt_tokens": pt,
-                    "completion_tokens": ct,
-                    "total_tokens": tt,
-                }
+                final_chunk["usage"] = _extract_usage({"usageMetadata": total_usage})
             send_sse(final_chunk)
 
             # Termination sentinel.
