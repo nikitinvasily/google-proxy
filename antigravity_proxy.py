@@ -1512,15 +1512,39 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
     return req
 
 
-def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
-    """Non-streaming call. Collects SSE chunks and returns combined response dict."""
-    chunks = list(stream_generate_content(envelope))
-    if trace is not None:
-        for chunk in chunks:
-            trace.observe(chunk)
-    if not chunks:
-        raise UpstreamError("Empty response from upstream stream", status=502)
+def _is_immediate_prohibited_content_event(event: dict) -> bool:
+    if not isinstance(event, dict):
+        return False
+    resp = event.get("response", event)
+    if not isinstance(resp, dict):
+        return False
+    candidates = resp.get("candidates") or []
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        reason = str(cand.get("finishReason") or cand.get("stopReason") or "").upper()
+        if reason == "PROHIBITED_CONTENT":
+            content = cand.get("content") or {}
+            parts = content.get("parts") or []
+            if not isinstance(parts, list):
+                parts = []
+            has_visible_or_fc = False
+            for part in parts:
+                if isinstance(part, dict):
+                    if part.get("text") and not part.get("thought"):
+                        has_visible_or_fc = True
+                        break
+                    if part.get("functionCall"):
+                        has_visible_or_fc = True
+                        break
+            if not has_visible_or_fc:
+                return True
+    return False
 
+
+def _parse_sse_chunks(chunks: list):
     combined_parts = []
     function_parts_by_id = {}
     last_finish_reason = None
@@ -1569,6 +1593,62 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
                 total_thoughts_tokens = um.get("thoughtsTokenCount")
             if um.get("totalTokenCount"):
                 total_tokens_reported = um.get("totalTokenCount")
+
+    return (
+        combined_parts,
+        last_finish_reason,
+        total_prompt_tokens,
+        total_candidates_tokens,
+        total_cached_tokens,
+        total_thoughts_tokens,
+        total_tokens_reported,
+        model_version,
+        prompt_feedback,
+    )
+
+
+def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
+    """Non-streaming call. Collects SSE chunks and returns combined response dict."""
+    chunks = list(stream_generate_content(envelope))
+    if not chunks:
+        raise UpstreamError("Empty response from upstream stream", status=502)
+
+    (
+        combined_parts,
+        last_finish_reason,
+        total_prompt_tokens,
+        total_candidates_tokens,
+        total_cached_tokens,
+        total_thoughts_tokens,
+        total_tokens_reported,
+        model_version,
+        prompt_feedback,
+    ) = _parse_sse_chunks(chunks)
+
+    has_visible_or_fc = any(
+        isinstance(p, dict) and ((p.get("text") and not p.get("thought")) or p.get("functionCall"))
+        for p in combined_parts
+    )
+    if str(last_finish_reason or "").upper() == "PROHIBITED_CONTENT" and not has_visible_or_fc:
+        _log("PROHIBITED_CONTENT with empty output in call_generate_content; retrying upstream once")
+        chunks = list(stream_generate_content(envelope))
+        if not chunks:
+            raise UpstreamError("Empty response from upstream stream", status=502)
+        (
+            combined_parts,
+            last_finish_reason,
+            total_prompt_tokens,
+            total_candidates_tokens,
+            total_cached_tokens,
+            total_thoughts_tokens,
+            total_tokens_reported,
+            model_version,
+            prompt_feedback,
+        ) = _parse_sse_chunks(chunks)
+
+    if trace is not None:
+        for chunk in chunks:
+            trace.observe(chunk)
 
     if not last_finish_reason and not (prompt_feedback or {}).get("blockReason"):
         raise UpstreamError("Upstream stream ended without finishReason", status=502)
@@ -2226,6 +2306,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _log(f"Upstream start failed: {type(e).__name__}")
             self._send_error_json("upstream_error", "Upstream request failed", http_code=502)
             return
+
+        if _is_immediate_prohibited_content_event(first_event):
+            try:
+                gen.close()
+            except Exception:
+                pass
+            _log("Immediate PROHIBITED_CONTENT on first stream event; retrying upstream once")
+            try:
+                gen = iter(stream_generate_content(envelope))
+                first_event = next(gen)
+            except StopIteration:
+                self._send_error_json("upstream_error", "Empty upstream response", http_code=502)
+                return
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
+            except Exception as e:
+                _log(f"Upstream start failed: {type(e).__name__}")
+                self._send_error_json("upstream_error", "Upstream request failed", http_code=502)
+                return
 
         # Send SSE headers only after the upstream yielded its first event.
         try:

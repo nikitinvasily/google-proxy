@@ -38,8 +38,8 @@ class StreamIntegrityTests(unittest.TestCase):
                b'event: error\ndata: {"error":{"code":429,"message":"SECRET_SENTINEL"}}\n\n')
         h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
         h.wfile = io.BytesIO()
-        h.send_response = lambda *args: None
-        h.send_header = lambda *args: None
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
         h.end_headers = lambda *args: None
         with patch.object(proxy, "get_access_token", return_value="dummy"), patch.object(proxy, "urlopen", return_value=io.BytesIO(raw)):
             h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
@@ -69,8 +69,8 @@ class StreamIntegrityTests(unittest.TestCase):
             raise proxy.UpstreamError("SECRET_SENTINEL", status=429)
         h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
         h.wfile = io.BytesIO()
-        h.send_response = lambda *args: None
-        h.send_header = lambda *args: None
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
         h.end_headers = lambda *args: None
         with patch.object(proxy, "stream_generate_content", side_effect=events):
             h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
@@ -109,6 +109,50 @@ class StreamIntegrityTests(unittest.TestCase):
         response = {"candidates": [{"content": {"parts": [{"functionCall": {"name": "terminal", "args": {"command": "pwd"}}}]}, "finishReason": "MAX_TOKENS"}]}
         result = proxy.gemini_response_to_openai(response, "gemini-3-flash", {"terminal"})
         self.assertEqual(result["choices"][0]["finish_reason"], "length")
+
+    def test_stream_retries_once_on_immediate_prohibited_content(self):
+        call_1 = [{"response": {"candidates": [{"finishReason": "PROHIBITED_CONTENT"}]}}]
+        call_2 = [{"response": {"candidates": [{"content": {"parts": [{"text": "recovered"}]}, "finishReason": "STOP"}]}}]
+        h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
+        h.end_headers = lambda *args: None
+        with patch.object(proxy, "stream_generate_content", side_effect=[iter(call_1), iter(call_2)]) as mock_stream:
+            h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
+        self.assertEqual(mock_stream.call_count, 2)
+        body = h.wfile.getvalue().decode()
+        chunks = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
+        texts = [c["choices"][0]["delta"].get("content") for c in chunks if c.get("choices") and "content" in c["choices"][0].get("delta", {})]
+        self.assertIn("recovered", "".join(t for t in texts if t))
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_stream_surfaces_content_filter_when_prohibited_content_persists(self):
+        call_1 = [{"response": {"candidates": [{"finishReason": "PROHIBITED_CONTENT"}]}}]
+        call_2 = [{"response": {"candidates": [{"finishReason": "PROHIBITED_CONTENT"}]}}]
+        h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
+        h.end_headers = lambda *args: None
+        with patch.object(proxy, "stream_generate_content", side_effect=[iter(call_1), iter(call_2)]) as mock_stream:
+            h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
+        self.assertEqual(mock_stream.call_count, 2)
+        body = h.wfile.getvalue().decode()
+        chunks = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "content_filter")
+
+    def test_nonstream_retries_once_on_prohibited_content(self):
+        call_1 = [{"response": {"candidates": [{"finishReason": "PROHIBITED_CONTENT"}]}}]
+        call_2 = [{"response": {"candidates": [{"content": {"parts": [{"text": "recovered"}]}, "finishReason": "STOP"}]}}]
+        with patch.object(proxy, "stream_generate_content", side_effect=[iter(call_1), iter(call_2)]) as mock_stream:
+            response = proxy.call_generate_content({"request": {}})
+        self.assertEqual(mock_stream.call_count, 2)
+        self.assertEqual(response["candidates"][0]["finishReason"], "STOP")
+        self.assertEqual(response["candidates"][0]["content"]["parts"][0]["text"], "recovered")
+        result = proxy.gemini_response_to_openai(response, "gemini-3-flash")
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(result["choices"][0]["message"]["content"], "recovered")
 
 
 if __name__ == "__main__":
