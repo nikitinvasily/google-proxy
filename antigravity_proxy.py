@@ -956,7 +956,15 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
             continue
 
         if role == "assistant":
-            parts = _content_to_parts(msg.get("content"))
+            reasoning_text = msg.get("reasoning_content")
+            if not isinstance(reasoning_text, str) or not reasoning_text:
+                reasoning_text = msg.get("reasoning")
+            thought_parts = (
+                [{"text": reasoning_text, "thought": True}]
+                if isinstance(reasoning_text, str) and reasoning_text.strip()
+                else []
+            )
+            parts = thought_parts + _content_to_parts(msg.get("content"))
             # Prior tool calls from the assistant -> functionCall parts.
             # Hermes persists thought signatures in extra_content, not in tool-call IDs.
             tool_calls = msg.get("tool_calls") or []
@@ -1278,6 +1286,85 @@ def _extract_usage(response: dict) -> dict:
     return res
 
 
+_ARGON_INTENT_RE = re.compile(
+    r'(?:'
+    r'[Фф]ормиру(?:ю|ем)|'
+    r'[Оо]твеч(?:у|аю)|'
+    r'[Дд]ам\s+(?:чёткий|краткий|финальный|полный|итоговый)|'
+    r'[Сс]формулиру(?:ю|ем)|'
+    r'[Нн]апиш(?:у|ем)\s+(?:ответ|отчёт|кратко|пользователю|Василию)|'
+    r'[Пп]одготовл(?:ю|им)\s+(?:ответ|отчёт)|'
+    r'[Сс]ообщ(?:у|им)\s+(?:результат|пользователю|Василию|кратко)|'
+    r'[Рр]езюмиру(?:ю|ем)|'
+    r'[Вв]ыда(?:ю|ём)\s+(?:ответ|отчёт)|'
+    r'[Пп]риступаю\s+к\s+ответу|'
+    r'[Мм]ожно\s+отвечать(?:\s+пользователю)?|'
+    r'[Пп]ерехожу\s+к\s+(?:финальному\s+)?ответу'
+    r')'
+    r'(?:[а-яёa-z]\.\s*|[^.!\n]){0,180}[.!]'
+    r'(?=\s*(?:\*\*|#|⚡|✅|📊|📌|🔹|[А-ЯЁA-Z]))'
+)
+
+_ARGON_GLUE_RE = re.compile(
+    r'([а-яёa-z0-9)\]`"»]{3,}[.!])'
+    r'(?=(?:\*\*[А-ЯЁA-Z0-9]|#[#\s]|[⚡✅📊📌🔹]|[А-ЯЁ][а-яё]{2,}))'
+)
+
+_ARGON_THOUGHT_MARKERS = (
+    "Let's ",
+    "Давай проверим",
+    "Давайте проверим",
+    "Сделаю ",
+    "Проверим в ",
+    "Посмотрим ",
+    "Взглянем ",
+    "Нужно проверить",
+    "СТОП",
+    "БИНГО",
+    "СЕКУНД",
+    "<|thought|>",
+)
+
+
+def _split_unmarked_argon_thought(text: str, has_tool_calls: bool = False) -> tuple[str, str]:
+    """Split unmarked thought and visible text for gemini-4-argon models."""
+    if not text:
+        return "", ""
+
+    if "<|/thought|>" in text:
+        r, _, v = text.partition("<|/thought|>")
+        if "<|thought|>" in r:
+            r = r.split("<|thought|>", 1)[1]
+        return r.strip(), v.lstrip()
+
+    matches = list(_ARGON_INTENT_RE.finditer(text))
+    if matches:
+        m = matches[-1]
+        r = text[:m.end()].strip()
+        v = text[m.end():].lstrip()
+        if r.startswith("<|thought|>"):
+            r = r[len("<|thought|>"):].lstrip()
+        return r, v
+
+    glue_matches = list(_ARGON_GLUE_RE.finditer(text))
+    if glue_matches:
+        m = glue_matches[-1]
+        r = text[:m.end(1)].strip()
+        v = text[m.end(1):].lstrip()
+        if r.startswith("<|thought|>"):
+            r = r[len("<|thought|>"):].lstrip()
+        return r, v
+
+    if has_tool_calls:
+        if len(text) > 180 or any(marker in text for marker in _ARGON_THOUGHT_MARKERS):
+            r = text.strip()
+            if r.startswith("<|thought|>"):
+                r = r[len("<|thought|>"):].lstrip()
+            return r, ""
+
+    return "", text
+
+
 def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=None) -> dict:
     """Transform an unwrapped Gemini generateContent response to OpenAI
     chat.completion format.
@@ -1295,6 +1382,10 @@ def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=Non
         parts = content.get("parts") or []
         text, tool_calls, _ = _extract_parts(parts, allowed_tool_names)
         reasoning = _extract_thought_text(parts)
+        if not reasoning and text and str(model).startswith("gemini-4-argon"):
+            split_r, split_t = _split_unmarked_argon_thought(text, has_tool_calls=bool(tool_calls))
+            reasoning = split_r
+            text = split_t
         if tool_calls:
             finish_reason = _finish_reason_from_gemini(cand, tool_calls)
         # Assign tool call ids.
@@ -2377,6 +2468,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         total_usage = None
         events_processed = 0
         emitted_visible = False
+        is_argon = str(openai_model).startswith("gemini-4-argon")
+        saw_native_thought = False
+        argon_seam_resolved = False
+        argon_buffer = ""
 
         try:
             for event in itertools.chain((first_event,), gen):
@@ -2474,6 +2569,58 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         }
                         finish_reason = mapping.get(fr_up, "stop")
 
+                if is_argon:
+                    if reasoning_delta:
+                        saw_native_thought = True
+                        if argon_buffer:
+                            text_delta = argon_buffer + (text_delta or "")
+                            argon_buffer = ""
+                    elif not saw_native_thought and not argon_seam_resolved:
+                        if text_delta:
+                            argon_buffer += text_delta
+                            text_delta = ""
+                        if fr:
+                            has_tc = bool(tool_call_deltas or seen_tool_calls or finish_reason == "tool_calls")
+                            if pending_text:
+                                argon_buffer += pending_text
+                                pending_text = ""
+                                checking_text_call = False
+                            split_r, split_t = _split_unmarked_argon_thought(argon_buffer, has_tool_calls=has_tc)
+                            argon_buffer = ""
+                            argon_seam_resolved = True
+                            if split_r:
+                                if not send_sse({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": openai_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"reasoning_content": split_r},
+                                        "finish_reason": None,
+                                    }],
+                                }):
+                                    return
+                                if has_tc:
+                                    emitted_visible = True
+                            if split_t:
+                                textual_call = (
+                                    _parse_text_tool_call(split_t, allowed_tool_names)
+                                    if not blocked_reason
+                                    else None
+                                )
+                                if textual_call and (finish_reason == "tool_calls" or tool_call_deltas):
+                                    pass
+                                elif textual_call:
+                                    tool_call_deltas.append(
+                                        {"index": len(seen_tool_calls), **textual_call}
+                                    )
+                                    textual_calls_emitted += 1
+                                    if finish_reason != "length":
+                                        finish_reason = "tool_calls"
+                                else:
+                                    text_delta = split_t
+
                 # Build delta.
                 delta = {}
                 if reasoning_delta:
@@ -2502,7 +2649,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 }
                 if not send_sse(chunk):
                     return
-                if (delta.get("content") or "").strip() or delta.get("tool_calls"):
+                if (
+                    (delta.get("content") or "").strip()
+                    or delta.get("tool_calls")
+                    or (delta.get("reasoning_content") and (tool_call_deltas or seen_tool_calls or finish_reason == "tool_calls"))
+                ):
                     emitted_visible = True
 
             if blocked_reason:
@@ -2514,6 +2665,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 finish_reason = "length"
                 send_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created,
                           "model": openai_model, "choices": [{"index": 0, "delta": {"content": "[Upstream stream ended without finishReason]"}, "finish_reason": None}]})
+            if argon_buffer:
+                pending_text = argon_buffer + pending_text
+                argon_buffer = ""
             if pending_text:
                 textual_call = _parse_text_tool_call(pending_text, allowed_tool_names) if upstream_finished and not blocked_reason else None
                 if textual_call and finish_reason == "tool_calls":

@@ -39,6 +39,41 @@ class RequestConversionTests(unittest.TestCase):
             {"text": "first"}, {"text": "second"},
         ])
 
+    def test_assistant_reasoning_content_preserved_as_thought_part(self):
+        request = self.build([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "final answer", "reasoning_content": "internal reasoning"},
+        ])
+        assistant_parts = request["contents"][1]["parts"]
+        self.assertEqual(assistant_parts[0], {"text": "internal reasoning", "thought": True})
+        self.assertEqual(assistant_parts[1], {"text": "final answer"})
+
+    def test_assistant_reasoning_fallback_preserved_as_thought_part(self):
+        request = self.build([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "final answer", "reasoning": "legacy reasoning field"},
+        ])
+        assistant_parts = request["contents"][1]["parts"]
+        self.assertEqual(assistant_parts[0], {"text": "legacy reasoning field", "thought": True})
+        self.assertEqual(assistant_parts[1], {"text": "final answer"})
+
+    def test_assistant_reasoning_content_with_tool_calls_preserved(self):
+        request = self.build([
+            {"role": "user", "content": "query"},
+            {
+                "role": "assistant",
+                "reasoning_content": "thinking before lookup",
+                "tool_calls": [{
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"k":"v"}'},
+                }],
+            },
+        ])
+        assistant_parts = request["contents"][1]["parts"]
+        self.assertEqual(assistant_parts[0], {"text": "thinking before lookup", "thought": True})
+        self.assertEqual(assistant_parts[1]["functionCall"]["name"], "lookup")
+
 
 if __name__ == "__main__":
     unittest.main()

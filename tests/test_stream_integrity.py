@@ -154,6 +154,135 @@ class StreamIntegrityTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["finish_reason"], "stop")
         self.assertEqual(result["choices"][0]["message"]["content"], "recovered")
 
+    def test_argon_stream_splits_seam_with_bold_header(self):
+        events = [
+            {"response": {"candidates": [{"content": {"parts": [
+                {"text": "Размышляю над деталями запроса. Формирую финальный ответ.**Вечерний разбор задач**"}
+            ]}, "finishReason": "STOP"}]}}
+        ]
+        h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
+        h.end_headers = lambda: None
+        with patch.object(proxy, "stream_generate_content", return_value=iter(events)):
+            h._handle_stream({"request": {"tools": []}}, "gemini-4-argon-medium")
+        chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines()
+                  if line.startswith("data: {") and '"choices"' in line]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        reasonings = [d["reasoning_content"] for d in deltas if d.get("reasoning_content")]
+        contents = [d["content"] for d in deltas if d.get("content")]
+        self.assertEqual(reasonings, ["Размышляю над деталями запроса. Формирую финальный ответ."])
+        self.assertEqual(contents, ["**Вечерний разбор задач**"])
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_argon_stream_splits_seam_with_glued_capital_word(self):
+        events = [
+            {"response": {"candidates": [{"content": {"parts": [
+                {"text": "Проверил параметры. Дам чёткий отчёт пользователю.Проверил через API все сервисы."}
+            ]}, "finishReason": "STOP"}]}}
+        ]
+        h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
+        h.end_headers = lambda: None
+        with patch.object(proxy, "stream_generate_content", return_value=iter(events)):
+            h._handle_stream({"request": {"tools": []}}, "gemini-4-argon-medium")
+        chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines()
+                  if line.startswith("data: {") and '"choices"' in line]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        reasonings = [d["reasoning_content"] for d in deltas if d.get("reasoning_content")]
+        contents = [d["content"] for d in deltas if d.get("content")]
+        self.assertEqual(reasonings, ["Проверил параметры. Дам чёткий отчёт пользователю."])
+        self.assertEqual(contents, ["Проверил через API все сервисы."])
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_argon_stream_splits_seam_across_chunks(self):
+        events = [
+            {"response": {"candidates": [{"content": {"parts": [
+                {"text": "Всё проверено, можно отвечать пользователю."}
+            ]}}]}},
+            {"response": {"candidates": [{"content": {"parts": [
+                {"text": "Крон **b395c5213912** работает штатно."}
+            ]}, "finishReason": "STOP"}]}}
+        ]
+        h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
+        h.end_headers = lambda: None
+        with patch.object(proxy, "stream_generate_content", return_value=iter(events)):
+            h._handle_stream({"request": {"tools": []}}, "gemini-4-argon-medium")
+        chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines()
+                  if line.startswith("data: {") and '"choices"' in line]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        reasonings = [d["reasoning_content"] for d in deltas if d.get("reasoning_content")]
+        contents = [d["content"] for d in deltas if d.get("content")]
+        self.assertEqual(reasonings, ["Всё проверено, можно отвечать пользователю."])
+        self.assertEqual(contents, ["Крон **b395c5213912** работает штатно."])
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_argon_stream_tool_calls_moves_unmarked_thought_to_reasoning(self):
+        events = [
+            {"response": {"candidates": [{"content": {"parts": [
+                {"text": "Давай проверим статус контейнеров в системе."},
+                {"functionCall": {"name": "terminal", "id": "fc1", "args": {"command": "docker ps"}}}
+            ]}, "finishReason": "STOP"}]}}
+        ]
+        h = proxy.ProxyHandler.__new__(proxy.ProxyHandler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda code, message=None: None
+        h.send_header = lambda keyword, value: None
+        h.end_headers = lambda: None
+        envelope = {"request": {"tools": [{"functionDeclarations": [{"name": "terminal"}]}]}}
+        with patch.object(proxy, "stream_generate_content", return_value=iter(events)):
+            h._handle_stream(envelope, "gemini-4-argon-medium")
+        chunks = [json.loads(line[6:]) for line in h.wfile.getvalue().decode().splitlines()
+                  if line.startswith("data: {") and '"choices"' in line]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        reasonings = [d["reasoning_content"] for d in deltas if d.get("reasoning_content")]
+        contents = [d["content"] for d in deltas if d.get("content")]
+        calls = [call for delta in deltas for call in delta.get("tool_calls", [])]
+        self.assertEqual(reasonings, ["Давай проверим статус контейнеров в системе."])
+        self.assertEqual(contents, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "terminal")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertNotIn("empty", h.wfile.getvalue().decode().lower())
+
+    def test_argon_nonstream_splits_seam_and_tool_calls(self):
+        # Non-stream with seam
+        resp_seam = {
+            "candidates": [{
+                "content": {"parts": [{"text": "Сформулирую ясный, структурированный и исчерпывающий отчёт для Василия.Я провёл сквозной аудит."}]},
+                "finishReason": "STOP"
+            }]
+        }
+        res_seam = proxy.gemini_response_to_openai(resp_seam, "gemini-4-argon-medium")
+        msg_seam = res_seam["choices"][0]["message"]
+        self.assertEqual(msg_seam["reasoning_content"], "Сформулирую ясный, структурированный и исчерпывающий отчёт для Василия.")
+        self.assertEqual(msg_seam["content"], "Я провёл сквозной аудит.")
+        self.assertEqual(res_seam["choices"][0]["finish_reason"], "stop")
+
+        # Non-stream with tool calls
+        resp_tc = {
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "Let's check the database logs first."},
+                    {"functionCall": {"name": "terminal", "args": {"command": "cat /var/log/syslog"}}}
+                ]},
+                "finishReason": "STOP"
+            }]
+        }
+        res_tc = proxy.gemini_response_to_openai(resp_tc, "gemini-4-argon-medium", {"terminal"})
+        msg_tc = res_tc["choices"][0]["message"]
+        self.assertEqual(msg_tc["reasoning_content"], "Let's check the database logs first.")
+        self.assertIsNone(msg_tc["content"])
+        self.assertEqual(len(msg_tc["tool_calls"]), 1)
+        self.assertEqual(msg_tc["tool_calls"][0]["function"]["name"], "terminal")
+        self.assertEqual(res_tc["choices"][0]["finish_reason"], "tool_calls")
+
 
 if __name__ == "__main__":
     unittest.main()
