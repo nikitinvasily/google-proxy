@@ -92,6 +92,10 @@ UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
 
 DEFAULT_MODEL = "gemini-3-flash"
+CREDITS_FALLBACK_ENABLED = (
+    os.environ.get("ANTIGRAVITY_CREDITS_FALLBACK", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
@@ -1770,17 +1774,6 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
 
 def stream_generate_content(envelope: dict):
     """Streaming call. Yields parsed JSON event objects from the SSE stream."""
-    req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
-    try:
-        resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
-    except HTTPError as e:
-        _capture_upstream_error(e, envelope)
-        _log(f"Upstream HTTP {e.code} on streamGenerateContent")
-        e.close()
-        raise UpstreamError(f"Upstream stream HTTP {e.code}", status=e.code)
-    except URLError as e:
-        raise UpstreamError(f"Upstream stream network error: {e}", status=502)
-
     def parse_event(lines):
         if not lines:
             return None
@@ -1798,26 +1791,61 @@ def stream_generate_content(envelope: dict):
             raise UpstreamError(f"Upstream SSE HTTP {status}", status=status)
         return event
 
-    data_lines = []
-    try:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
-            line = line.rstrip("\r\n")
-            if line == "":
-                event = parse_event(data_lines)
-                data_lines = []
-                if event is not None:
-                    yield event
-                    if event.get("__done__"):
-                        break
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip(" "))
-        else:
-            event = parse_event(data_lines)
-            if event is not None:
-                yield event
-    finally:
-        resp.close()
+    can_fallback = bool(CREDITS_FALLBACK_ENABLED and "enabledCreditTypes" not in envelope)
+    retried = False
+    yielded_any = False
+    current_envelope = envelope
+
+    while True:
+        req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, current_envelope, streaming=True)
+        try:
+            resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
+        except HTTPError as e:
+            _capture_upstream_error(e, current_envelope)
+            _log(f"Upstream HTTP {e.code} on streamGenerateContent")
+            e.close()
+            if e.code == 429 and can_fallback and not retried and not yielded_any:
+                _log("Upstream 429 quota exhausted; retrying once with GOOGLE_ONE_AI credits")
+                retried = True
+                current_envelope = dict(envelope)
+                current_envelope["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
+                continue
+            raise UpstreamError(f"Upstream stream HTTP {e.code}", status=e.code)
+        except URLError as e:
+            raise UpstreamError(f"Upstream stream network error: {e}", status=502)
+
+        data_lines = []
+        try:
+            try:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+                    line = line.rstrip("\r\n")
+                    if line == "":
+                        event = parse_event(data_lines)
+                        data_lines = []
+                        if event is not None:
+                            yielded_any = True
+                            yield event
+                            if event.get("__done__"):
+                                break
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip(" "))
+                else:
+                    event = parse_event(data_lines)
+                    if event is not None:
+                        yielded_any = True
+                        yield event
+                return
+            finally:
+                resp.close()
+        except UpstreamError as e:
+            if e.status == 429 and can_fallback and not retried and not yielded_any:
+                _log("Upstream 429 quota exhausted; retrying once with GOOGLE_ONE_AI credits")
+                retried = True
+                current_envelope = dict(envelope)
+                current_envelope["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
+                continue
+            raise
 
 
 def _try_parse_one_event(buffer: str):
@@ -2768,12 +2796,20 @@ def _preflight_check():
 
 
 def main():
+    global CREDITS_FALLBACK_ENABLED
     parser = argparse.ArgumentParser(
         description="Antigravity OpenAI-compatible proxy (Cloud Code Assist API)"
     )
     parser.add_argument("--port", type=int, default=8877, help="Port to listen on (default 8877)")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default 127.0.0.1)")
+    parser.add_argument(
+        "--no-credits-fallback",
+        action="store_true",
+        help="Disable automatic fallback to GOOGLE_ONE_AI credits on HTTP 429",
+    )
     args = parser.parse_args()
+    if args.no_credits_fallback:
+        CREDITS_FALLBACK_ENABLED = False
 
     if not _preflight_check():
         sys.exit(1)

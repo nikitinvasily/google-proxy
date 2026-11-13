@@ -28,7 +28,7 @@ class StreamIntegrityTests(unittest.TestCase):
         h.send_response = lambda code: statuses.append(code)
         h.send_header = lambda *args: None
         h.end_headers = lambda *args: None
-        with patch.object(proxy, "get_access_token", return_value="dummy"), patch.object(proxy, "urlopen", return_value=io.BytesIO(raw)):
+        with patch.object(proxy, "get_access_token", return_value="dummy"), patch.object(proxy, "urlopen", side_effect=lambda *args, **kwargs: io.BytesIO(raw)):
             h._handle_stream({"request": {"tools": []}}, "gemini-3-flash")
         self.assertEqual(statuses, [429])
         self.assertNotIn("SECRET_SENTINEL", h.wfile.getvalue().decode())
