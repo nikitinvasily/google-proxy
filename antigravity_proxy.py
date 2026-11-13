@@ -96,6 +96,100 @@ CREDITS_FALLBACK_ENABLED = (
     os.environ.get("ANTIGRAVITY_CREDITS_FALLBACK", "1").strip().lower()
     not in ("0", "false", "no", "off")
 )
+_TRUTHY = ("1", "true", "yes", "on")
+# Epoch seconds until which the (weekly) base quota of a quota group is known to
+# be exhausted; while active we send enabledCreditTypes on the first attempt.
+_credits_exhausted_until: dict[str, float] = {}
+_credits_exhausted_lock = threading.Lock()
+_CREDITS_MAX_RESET_HORIZON = 7 * 24 * 60 * 60
+_CREDITS_LONG_DELAY_S = 60.0       # retry_delay_s above this => long-term quota
+_TRANSIENT_MAX_DELAY_S = 15.0      # backoff retry only if retry_delay_s <= this
+_TRANSIENT_MAX_RETRIES = 2
+_TRANSIENT_BACKOFFS = (1.0, 2.5)
+_CREDITS_EXHAUSTED_REASONS = frozenset(
+    {"CREDITS_EXHAUSTED", "INSUFFICIENT_CREDITS", "NO_CREDITS", "QUOTA_EXHAUSTED"}
+)
+
+
+def _force_credits_enabled() -> bool:
+    return os.environ.get("ANTIGRAVITY_FORCE_CREDITS", "").strip().lower() in _TRUTHY
+
+
+def _quota_group(model) -> str:
+    m = str(model or "").lower()
+    return "3p" if m.startswith(("claude-", "gpt-")) else "gemini"
+
+
+def _credits_cache_active(group: str, now: float | None = None) -> bool:
+    """True if group's base quota is cached as exhausted; drops expired entries."""
+    now = time.time() if now is None else now
+    with _credits_exhausted_lock:
+        until = _credits_exhausted_until.get(group)
+        if until is None:
+            return False
+        if now < until:
+            return True
+        _credits_exhausted_until.pop(group, None)
+        return False
+
+
+def _credits_cache_store(group: str, reset_epoch: float) -> None:
+    with _credits_exhausted_lock:
+        _credits_exhausted_until[group] = reset_epoch
+
+
+def _parse_duration_s(value) -> float | None:
+    """Parse '1.5s' / '500ms' / '12' into seconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else None
+    text = str(value).strip().lower()
+    try:
+        if text.endswith("ms"):
+            return float(text[:-2]) / 1000.0
+        if text.endswith("s"):
+            text = text[:-1]
+        out = float(text)
+        return out if out >= 0 else None
+    except ValueError:
+        return None
+
+
+def _parse_429_info(body_bytes: bytes | None, headers=None) -> dict:
+    """Extract reason, reset_epoch, retry_delay_s from a Cloud Code 429 body/headers."""
+    info = {"reason": None, "reset_epoch": None, "retry_delay_s": None}
+    try:
+        data = json.loads((body_bytes or b"").decode("utf-8", errors="replace") or "null")
+    except (ValueError, TypeError):
+        data = None
+    err = data.get("error") if isinstance(data, dict) else None
+    details = err.get("details") if isinstance(err, dict) else None
+    for d in details if isinstance(details, list) else []:
+        if not isinstance(d, dict):
+            continue
+        dtype = str(d.get("@type") or "")
+        if dtype.endswith("ErrorInfo") or "reason" in d:
+            if info["reason"] is None and isinstance(d.get("reason"), str):
+                info["reason"] = d["reason"]
+            meta = d.get("metadata")
+            if isinstance(meta, dict) and info["reset_epoch"] is None:
+                ts = meta.get("quotaResetTimeStamp")
+                if ts:
+                    epoch = _parse_expiry(ts)
+                    if epoch > 0:
+                        info["reset_epoch"] = epoch
+        if dtype.endswith("RetryInfo") or "retryDelay" in d:
+            delay = _parse_duration_s(d.get("retryDelay"))
+            if delay is not None:
+                info["retry_delay_s"] = delay
+    if info["retry_delay_s"] is None and headers is not None:
+        try:
+            info["retry_delay_s"] = _parse_duration_s(headers.get("Retry-After"))
+        except Exception:
+            pass
+    return info
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
@@ -112,6 +206,7 @@ UPSTREAM_ERROR_DIR = Path.home() / ".hermes" / "cache" / "proxy-upstream-errors"
 _upstream_error_lock = threading.Lock()
 _UPSTREAM_ERROR_BODY_LIMIT = 8192
 _UPSTREAM_ERROR_FILE_LIMIT = 50
+_UPSTREAM_ERROR_READ_LIMIT = 65536
 _UPSTREAM_ERROR_MAX_AGE = 24 * 60 * 60
 
 def _log(msg: str):
@@ -124,12 +219,16 @@ def _log(msg: str):
         pass
 
 
-def _capture_upstream_error(error: HTTPError, envelope: dict) -> None:
-    """Opt-in private response-body capture; never persist request content or headers."""
+def _capture_upstream_error(error: HTTPError, envelope: dict, body_bytes: bytes | None = None) -> None:
+    """Opt-in private response-body capture; never persist request content or headers.
+
+    ``body_bytes`` is the already-read response body (an HTTPError body can be read
+    only once); when omitted the body is read here.
+    """
     if os.environ.get("ANTIGRAVITY_CAPTURE_UPSTREAM_ERRORS") != "1":
         return
     try:
-        body = error.read(_UPSTREAM_ERROR_BODY_LIMIT + 1)
+        body = body_bytes if body_bytes is not None else error.read(_UPSTREAM_ERROR_BODY_LIMIT + 1)
         directory = UPSTREAM_ERROR_DIR
         with _upstream_error_lock:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1788,27 +1887,78 @@ def stream_generate_content(envelope: dict):
             error = event["error"]
             code = error.get("code") if isinstance(error, dict) else None
             status = code if isinstance(code, int) and 400 <= code <= 599 else 502
-            raise UpstreamError(f"Upstream SSE HTTP {status}", status=status)
+            err = UpstreamError(f"Upstream SSE HTTP {status}", status=status)
+            if status == 429:
+                err.info = _parse_429_info(data.encode("utf-8"))
+            raise err
         return event
 
+    model = envelope.get("model")
+    group = _quota_group(model)
     can_fallback = bool(CREDITS_FALLBACK_ENABLED and "enabledCreditTypes" not in envelope)
-    retried = False
+    transient_retries = 0
     yielded_any = False
     current_envelope = envelope
+
+    def with_credits() -> dict:
+        out = dict(envelope)
+        out["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
+        return out
+
+    # Preventive flag: forced, or base quota of this group known to be exhausted.
+    if can_fallback and (_force_credits_enabled() or _credits_cache_active(group)):
+        current_envelope = with_credits()
+
+    def handle_429(info: dict) -> bool:
+        """Decide whether a 429 is retried (True) or must be raised (False)."""
+        nonlocal current_envelope, transient_retries
+        reason = info.get("reason")
+        delay = info.get("retry_delay_s")
+        using_credits = "enabledCreditTypes" in current_envelope
+        _log(f"Upstream 429 status=429 model={str(model or '')[:64]} reason={reason} "
+             f"retry_delay_s={delay} using_credits={using_credits}")
+        if yielded_any:
+            return False
+        if not using_credits and can_fallback:
+            reset_epoch = info.get("reset_epoch")
+            now = time.time()
+            long_term = reason == "QUOTA_EXHAUSTED" or (delay is not None and delay > _CREDITS_LONG_DELAY_S)
+            if long_term and reset_epoch and now < reset_epoch <= now + _CREDITS_MAX_RESET_HORIZON:
+                _credits_cache_store(group, reset_epoch)
+                _log(f"Cached quota exhaustion for group={group} until epoch={int(reset_epoch)}")
+            _log("Upstream 429; retrying with GOOGLE_ONE_AI credits")
+            current_envelope = with_credits()
+            return True
+        if str(reason or "").upper() in _CREDITS_EXHAUSTED_REASONS:
+            return False
+        if delay is not None and delay > _TRANSIENT_MAX_DELAY_S:
+            return False
+        if transient_retries >= _TRANSIENT_MAX_RETRIES:
+            return False
+        backoff = _TRANSIENT_BACKOFFS[min(transient_retries, len(_TRANSIENT_BACKOFFS) - 1)]
+        wait = min(max(delay or backoff, 0.5), 5.0)
+        transient_retries += 1
+        _log(f"Transient 429; backoff retry {transient_retries}/{_TRANSIENT_MAX_RETRIES} in {wait:.1f}s")
+        time.sleep(wait)
+        return True
 
     while True:
         req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, current_envelope, streaming=True)
         try:
             resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
         except HTTPError as e:
-            _capture_upstream_error(e, current_envelope)
-            _log(f"Upstream HTTP {e.code} on streamGenerateContent")
+            try:
+                body_bytes = e.read(_UPSTREAM_ERROR_READ_LIMIT + 1)  # body is readable only once
+            except Exception:
+                body_bytes = b""
+            _capture_upstream_error(e, current_envelope, body_bytes)
+            info = None
+            if e.code == 429:
+                info = _parse_429_info(body_bytes, getattr(e, "headers", None))
+            else:
+                _log(f"Upstream HTTP {e.code} on streamGenerateContent")
             e.close()
-            if e.code == 429 and can_fallback and not retried and not yielded_any:
-                _log("Upstream 429 quota exhausted; retrying once with GOOGLE_ONE_AI credits")
-                retried = True
-                current_envelope = dict(envelope)
-                current_envelope["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
+            if info is not None and handle_429(info):
                 continue
             raise UpstreamError(f"Upstream stream HTTP {e.code}", status=e.code)
         except URLError as e:
@@ -1839,11 +1989,8 @@ def stream_generate_content(envelope: dict):
             finally:
                 resp.close()
         except UpstreamError as e:
-            if e.status == 429 and can_fallback and not retried and not yielded_any:
-                _log("Upstream 429 quota exhausted; retrying once with GOOGLE_ONE_AI credits")
-                retried = True
-                current_envelope = dict(envelope)
-                current_envelope["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
+            if e.status == 429 and not yielded_any and \
+                    handle_429(getattr(e, "info", None) or _parse_429_info(None)):
                 continue
             raise
 
