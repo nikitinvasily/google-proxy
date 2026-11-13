@@ -92,6 +92,104 @@ UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
 
 DEFAULT_MODEL = "gemini-3-flash"
+CREDITS_FALLBACK_ENABLED = (
+    os.environ.get("ANTIGRAVITY_CREDITS_FALLBACK", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+_TRUTHY = ("1", "true", "yes", "on")
+# Epoch seconds until which the (weekly) base quota of a quota group is known to
+# be exhausted; while active we send enabledCreditTypes on the first attempt.
+_credits_exhausted_until: dict[str, float] = {}
+_credits_exhausted_lock = threading.Lock()
+_CREDITS_MAX_RESET_HORIZON = 7 * 24 * 60 * 60
+_CREDITS_LONG_DELAY_S = 60.0       # retry_delay_s above this => long-term quota
+_TRANSIENT_MAX_DELAY_S = 15.0      # backoff retry only if retry_delay_s <= this
+_TRANSIENT_MAX_RETRIES = 2
+_TRANSIENT_BACKOFFS = (1.0, 2.5)
+_CREDITS_EXHAUSTED_REASONS = frozenset(
+    {"CREDITS_EXHAUSTED", "INSUFFICIENT_CREDITS", "NO_CREDITS", "QUOTA_EXHAUSTED"}
+)
+
+
+def _force_credits_enabled() -> bool:
+    return os.environ.get("ANTIGRAVITY_FORCE_CREDITS", "").strip().lower() in _TRUTHY
+
+
+def _quota_group(model) -> str:
+    m = str(model or "").lower()
+    return "3p" if m.startswith(("claude-", "gpt-")) else "gemini"
+
+
+def _credits_cache_active(group: str, now: float | None = None) -> bool:
+    """True if group's base quota is cached as exhausted; drops expired entries."""
+    now = time.time() if now is None else now
+    with _credits_exhausted_lock:
+        until = _credits_exhausted_until.get(group)
+        if until is None:
+            return False
+        if now < until:
+            return True
+        _credits_exhausted_until.pop(group, None)
+        return False
+
+
+def _credits_cache_store(group: str, reset_epoch: float) -> None:
+    with _credits_exhausted_lock:
+        _credits_exhausted_until[group] = reset_epoch
+
+
+def _parse_duration_s(value) -> float | None:
+    """Parse '1.5s' / '500ms' / '12' into seconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else None
+    text = str(value).strip().lower()
+    try:
+        if text.endswith("ms"):
+            return float(text[:-2]) / 1000.0
+        if text.endswith("s"):
+            text = text[:-1]
+        out = float(text)
+        return out if out >= 0 else None
+    except ValueError:
+        return None
+
+
+def _parse_429_info(body_bytes: bytes | None, headers=None) -> dict:
+    """Extract reason, reset_epoch, retry_delay_s from a Cloud Code 429 body/headers."""
+    info = {"reason": None, "reset_epoch": None, "retry_delay_s": None}
+    try:
+        data = json.loads((body_bytes or b"").decode("utf-8", errors="replace") or "null")
+    except (ValueError, TypeError):
+        data = None
+    err = data.get("error") if isinstance(data, dict) else None
+    details = err.get("details") if isinstance(err, dict) else None
+    for d in details if isinstance(details, list) else []:
+        if not isinstance(d, dict):
+            continue
+        dtype = str(d.get("@type") or "")
+        if dtype.endswith("ErrorInfo") or "reason" in d:
+            if info["reason"] is None and isinstance(d.get("reason"), str):
+                info["reason"] = d["reason"]
+            meta = d.get("metadata")
+            if isinstance(meta, dict) and info["reset_epoch"] is None:
+                ts = meta.get("quotaResetTimeStamp")
+                if ts:
+                    epoch = _parse_expiry(ts)
+                    if epoch > 0:
+                        info["reset_epoch"] = epoch
+        if dtype.endswith("RetryInfo") or "retryDelay" in d:
+            delay = _parse_duration_s(d.get("retryDelay"))
+            if delay is not None:
+                info["retry_delay_s"] = delay
+    if info["retry_delay_s"] is None and headers is not None:
+        try:
+            info["retry_delay_s"] = _parse_duration_s(headers.get("Retry-After"))
+        except Exception:
+            pass
+    return info
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
@@ -108,6 +206,7 @@ UPSTREAM_ERROR_DIR = Path.home() / ".hermes" / "cache" / "proxy-upstream-errors"
 _upstream_error_lock = threading.Lock()
 _UPSTREAM_ERROR_BODY_LIMIT = 8192
 _UPSTREAM_ERROR_FILE_LIMIT = 50
+_UPSTREAM_ERROR_READ_LIMIT = 65536
 _UPSTREAM_ERROR_MAX_AGE = 24 * 60 * 60
 
 def _log(msg: str):
@@ -120,12 +219,16 @@ def _log(msg: str):
         pass
 
 
-def _capture_upstream_error(error: HTTPError, envelope: dict) -> None:
-    """Opt-in private response-body capture; never persist request content or headers."""
+def _capture_upstream_error(error: HTTPError, envelope: dict, body_bytes: bytes | None = None) -> None:
+    """Opt-in private response-body capture; never persist request content or headers.
+
+    ``body_bytes`` is the already-read response body (an HTTPError body can be read
+    only once); when omitted the body is read here.
+    """
     if os.environ.get("ANTIGRAVITY_CAPTURE_UPSTREAM_ERRORS") != "1":
         return
     try:
-        body = error.read(_UPSTREAM_ERROR_BODY_LIMIT + 1)
+        body = body_bytes if body_bytes is not None else error.read(_UPSTREAM_ERROR_BODY_LIMIT + 1)
         directory = UPSTREAM_ERROR_DIR
         with _upstream_error_lock:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -956,7 +1059,15 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level = None)
             continue
 
         if role == "assistant":
-            parts = _content_to_parts(msg.get("content"))
+            reasoning_text = msg.get("reasoning_content")
+            if not isinstance(reasoning_text, str) or not reasoning_text:
+                reasoning_text = msg.get("reasoning")
+            thought_parts = (
+                [{"text": reasoning_text, "thought": True}]
+                if isinstance(reasoning_text, str) and reasoning_text.strip()
+                else []
+            )
+            parts = thought_parts + _content_to_parts(msg.get("content"))
             # Prior tool calls from the assistant -> functionCall parts.
             # Hermes persists thought signatures in extra_content, not in tool-call IDs.
             tool_calls = msg.get("tool_calls") or []
@@ -1264,11 +1375,97 @@ def _extract_usage(response: dict) -> dict:
     pt = usage.get("promptTokenCount", 0) or 0
     ct = usage.get("candidatesTokenCount", 0) or usage.get("completionTokenCount", 0) or 0
     tt = usage.get("totalTokenCount", (pt + ct)) or (pt + ct)
-    return {
+    cached = usage.get("cachedContentTokenCount", 0) or 0
+    thoughts = usage.get("thoughtsTokenCount", 0) or 0
+    res = {
         "prompt_tokens": pt,
         "completion_tokens": ct,
         "total_tokens": tt,
     }
+    if cached:
+        res["prompt_tokens_details"] = {"cached_tokens": cached}
+    if thoughts:
+        res["completion_tokens_details"] = {"reasoning_tokens": thoughts}
+    return res
+
+
+_ARGON_INTENT_RE = re.compile(
+    r'(?:'
+    r'[Фф]ормиру(?:ю|ем)|'
+    r'[Оо]твеч(?:у|аю)|'
+    r'[Дд]ам\s+(?:чёткий|краткий|финальный|полный|итоговый)|'
+    r'[Сс]формулиру(?:ю|ем)|'
+    r'[Нн]апиш(?:у|ем)\s+(?:ответ|отчёт|кратко|пользователю|Василию)|'
+    r'[Пп]одготовл(?:ю|им)\s+(?:ответ|отчёт)|'
+    r'[Сс]ообщ(?:у|им)\s+(?:результат|пользователю|Василию|кратко)|'
+    r'[Рр]езюмиру(?:ю|ем)|'
+    r'[Вв]ыда(?:ю|ём)\s+(?:ответ|отчёт)|'
+    r'[Пп]риступаю\s+к\s+ответу|'
+    r'[Мм]ожно\s+отвечать(?:\s+пользователю)?|'
+    r'[Пп]ерехожу\s+к\s+(?:финальному\s+)?ответу'
+    r')'
+    r'(?:[а-яёa-z]\.\s*|[^.!\n]){0,180}[.!]'
+    r'(?=\s*(?:\*\*|#|⚡|✅|📊|📌|🔹|[А-ЯЁA-Z]))'
+)
+
+_ARGON_GLUE_RE = re.compile(
+    r'([а-яёa-z0-9)\]`"»]{3,}[.!])'
+    r'(?=(?:\*\*[А-ЯЁA-Z0-9]|#[#\s]|[⚡✅📊📌🔹]|[А-ЯЁ][а-яё]{2,}))'
+)
+
+_ARGON_THOUGHT_MARKERS = (
+    "Let's ",
+    "Давай проверим",
+    "Давайте проверим",
+    "Сделаю ",
+    "Проверим в ",
+    "Посмотрим ",
+    "Взглянем ",
+    "Нужно проверить",
+    "СТОП",
+    "БИНГО",
+    "СЕКУНД",
+    "<|thought|>",
+)
+
+
+def _split_unmarked_argon_thought(text: str, has_tool_calls: bool = False) -> tuple[str, str]:
+    """Split unmarked thought and visible text for gemini-4-argon models."""
+    if not text:
+        return "", ""
+
+    if "<|/thought|>" in text:
+        r, _, v = text.partition("<|/thought|>")
+        if "<|thought|>" in r:
+            r = r.split("<|thought|>", 1)[1]
+        return r.strip(), v.lstrip()
+
+    matches = list(_ARGON_INTENT_RE.finditer(text))
+    if matches:
+        m = matches[-1]
+        r = text[:m.end()].strip()
+        v = text[m.end():].lstrip()
+        if r.startswith("<|thought|>"):
+            r = r[len("<|thought|>"):].lstrip()
+        return r, v
+
+    glue_matches = list(_ARGON_GLUE_RE.finditer(text))
+    if glue_matches:
+        m = glue_matches[-1]
+        r = text[:m.end(1)].strip()
+        v = text[m.end(1):].lstrip()
+        if r.startswith("<|thought|>"):
+            r = r[len("<|thought|>"):].lstrip()
+        return r, v
+
+    if has_tool_calls:
+        if len(text) > 180 or any(marker in text for marker in _ARGON_THOUGHT_MARKERS):
+            r = text.strip()
+            if r.startswith("<|thought|>"):
+                r = r[len("<|thought|>"):].lstrip()
+            return r, ""
+
+    return "", text
 
 
 def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=None) -> dict:
@@ -1288,6 +1485,10 @@ def gemini_response_to_openai(response: dict, model: str, allowed_tool_names=Non
         parts = content.get("parts") or []
         text, tool_calls, _ = _extract_parts(parts, allowed_tool_names)
         reasoning = _extract_thought_text(parts)
+        if not reasoning and text and str(model).startswith("gemini-4-argon"):
+            split_r, split_t = _split_unmarked_argon_thought(text, has_tool_calls=bool(tool_calls))
+            reasoning = split_r
+            text = split_t
         if tool_calls:
             finish_reason = _finish_reason_from_gemini(cand, tool_calls)
         # Assign tool call ids.
@@ -1505,20 +1706,47 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
     return req
 
 
-def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
-    """Non-streaming call. Collects SSE chunks and returns combined response dict."""
-    chunks = list(stream_generate_content(envelope))
-    if trace is not None:
-        for chunk in chunks:
-            trace.observe(chunk)
-    if not chunks:
-        raise UpstreamError("Empty response from upstream stream", status=502)
+def _is_immediate_prohibited_content_event(event: dict) -> bool:
+    if not isinstance(event, dict):
+        return False
+    resp = event.get("response", event)
+    if not isinstance(resp, dict):
+        return False
+    candidates = resp.get("candidates") or []
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        reason = str(cand.get("finishReason") or cand.get("stopReason") or "").upper()
+        if reason == "PROHIBITED_CONTENT":
+            content = cand.get("content") or {}
+            parts = content.get("parts") or []
+            if not isinstance(parts, list):
+                parts = []
+            has_visible_or_fc = False
+            for part in parts:
+                if isinstance(part, dict):
+                    if part.get("text") and not part.get("thought"):
+                        has_visible_or_fc = True
+                        break
+                    if part.get("functionCall"):
+                        has_visible_or_fc = True
+                        break
+            if not has_visible_or_fc:
+                return True
+    return False
 
+
+def _parse_sse_chunks(chunks: list):
     combined_parts = []
     function_parts_by_id = {}
     last_finish_reason = None
     total_prompt_tokens = 0
     total_candidates_tokens = 0
+    total_cached_tokens = 0
+    total_thoughts_tokens = 0
+    total_tokens_reported = 0
     model_version = ""
     prompt_feedback = None
 
@@ -1547,16 +1775,90 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
                 last_finish_reason = reason
         if resp.get("modelVersion"):
             model_version = resp.get("modelVersion")
-        um = resp.get("usageMetadata") or {}
-        if um.get("promptTokenCount"):
-            total_prompt_tokens = um.get("promptTokenCount")
-        if um.get("candidatesTokenCount"):
-            total_candidates_tokens = um.get("candidatesTokenCount")
+        um = resp.get("usageMetadata")
+        if isinstance(um, dict):
+            if um.get("promptTokenCount"):
+                total_prompt_tokens = um.get("promptTokenCount")
+            if um.get("candidatesTokenCount"):
+                total_candidates_tokens = um.get("candidatesTokenCount")
+            if um.get("cachedContentTokenCount"):
+                total_cached_tokens = um.get("cachedContentTokenCount")
+            if um.get("thoughtsTokenCount"):
+                total_thoughts_tokens = um.get("thoughtsTokenCount")
+            if um.get("totalTokenCount"):
+                total_tokens_reported = um.get("totalTokenCount")
+
+    return (
+        combined_parts,
+        last_finish_reason,
+        total_prompt_tokens,
+        total_candidates_tokens,
+        total_cached_tokens,
+        total_thoughts_tokens,
+        total_tokens_reported,
+        model_version,
+        prompt_feedback,
+    )
+
+
+def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
+    """Non-streaming call. Collects SSE chunks and returns combined response dict."""
+    chunks = list(stream_generate_content(envelope))
+    if not chunks:
+        raise UpstreamError("Empty response from upstream stream", status=502)
+
+    (
+        combined_parts,
+        last_finish_reason,
+        total_prompt_tokens,
+        total_candidates_tokens,
+        total_cached_tokens,
+        total_thoughts_tokens,
+        total_tokens_reported,
+        model_version,
+        prompt_feedback,
+    ) = _parse_sse_chunks(chunks)
+
+    has_visible_or_fc = any(
+        isinstance(p, dict) and ((p.get("text") and not p.get("thought")) or p.get("functionCall"))
+        for p in combined_parts
+    )
+    if str(last_finish_reason or "").upper() == "PROHIBITED_CONTENT" and not has_visible_or_fc:
+        _log("PROHIBITED_CONTENT with empty output in call_generate_content; retrying upstream once")
+        chunks = list(stream_generate_content(envelope))
+        if not chunks:
+            raise UpstreamError("Empty response from upstream stream", status=502)
+        (
+            combined_parts,
+            last_finish_reason,
+            total_prompt_tokens,
+            total_candidates_tokens,
+            total_cached_tokens,
+            total_thoughts_tokens,
+            total_tokens_reported,
+            model_version,
+            prompt_feedback,
+        ) = _parse_sse_chunks(chunks)
+
+    if trace is not None:
+        for chunk in chunks:
+            trace.observe(chunk)
 
     if not last_finish_reason and not (prompt_feedback or {}).get("blockReason"):
         raise UpstreamError("Upstream stream ended without finishReason", status=502)
     total_prompt = total_prompt_tokens or 0
     total_candidates = total_candidates_tokens or 0
+    cached_val = total_cached_tokens or 0
+    thoughts_val = total_thoughts_tokens or 0
+    usage_metadata = {
+        "promptTokenCount": total_prompt,
+        "candidatesTokenCount": total_candidates,
+        "totalTokenCount": total_tokens_reported or (total_prompt + total_candidates),
+    }
+    if cached_val > 0:
+        usage_metadata["cachedContentTokenCount"] = cached_val
+    if thoughts_val > 0:
+        usage_metadata["thoughtsTokenCount"] = thoughts_val
     resp_dict = {
         "candidates": ([{
             "content": {"role": "model", "parts": combined_parts},
@@ -1564,28 +1866,13 @@ def call_generate_content(envelope: dict, trace: ShapeTrace = None) -> dict:
         }] if last_finish_reason else []),
         "promptFeedback": prompt_feedback or {},
         "modelVersion": model_version,
-        "usageMetadata": {
-            "promptTokenCount": total_prompt,
-            "candidatesTokenCount": total_candidates,
-            "totalTokenCount": total_prompt + total_candidates,
-        }
+        "usageMetadata": usage_metadata,
     }
     return resp_dict
 
 
 def stream_generate_content(envelope: dict):
     """Streaming call. Yields parsed JSON event objects from the SSE stream."""
-    req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
-    try:
-        resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
-    except HTTPError as e:
-        _capture_upstream_error(e, envelope)
-        _log(f"Upstream HTTP {e.code} on streamGenerateContent")
-        e.close()
-        raise UpstreamError(f"Upstream stream HTTP {e.code}", status=e.code)
-    except URLError as e:
-        raise UpstreamError(f"Upstream stream network error: {e}", status=502)
-
     def parse_event(lines):
         if not lines:
             return None
@@ -1600,29 +1887,112 @@ def stream_generate_content(envelope: dict):
             error = event["error"]
             code = error.get("code") if isinstance(error, dict) else None
             status = code if isinstance(code, int) and 400 <= code <= 599 else 502
-            raise UpstreamError(f"Upstream SSE HTTP {status}", status=status)
+            err = UpstreamError(f"Upstream SSE HTTP {status}", status=status)
+            if status == 429:
+                err.info = _parse_429_info(data.encode("utf-8"))
+            raise err
         return event
 
-    data_lines = []
-    try:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
-            line = line.rstrip("\r\n")
-            if line == "":
-                event = parse_event(data_lines)
-                data_lines = []
-                if event is not None:
-                    yield event
-                    if event.get("__done__"):
-                        break
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip(" "))
-        else:
-            event = parse_event(data_lines)
-            if event is not None:
-                yield event
-    finally:
-        resp.close()
+    model = envelope.get("model")
+    group = _quota_group(model)
+    can_fallback = bool(CREDITS_FALLBACK_ENABLED and "enabledCreditTypes" not in envelope)
+    transient_retries = 0
+    yielded_any = False
+    current_envelope = envelope
+
+    def with_credits() -> dict:
+        out = dict(envelope)
+        out["enabledCreditTypes"] = ["GOOGLE_ONE_AI"]
+        return out
+
+    # Preventive flag: forced, or base quota of this group known to be exhausted.
+    if can_fallback and (_force_credits_enabled() or _credits_cache_active(group)):
+        current_envelope = with_credits()
+
+    def handle_429(info: dict) -> bool:
+        """Decide whether a 429 is retried (True) or must be raised (False)."""
+        nonlocal current_envelope, transient_retries
+        reason = info.get("reason")
+        delay = info.get("retry_delay_s")
+        using_credits = "enabledCreditTypes" in current_envelope
+        _log(f"Upstream 429 status=429 model={str(model or '')[:64]} reason={reason} "
+             f"retry_delay_s={delay} using_credits={using_credits}")
+        if yielded_any:
+            return False
+        if not using_credits and can_fallback:
+            reset_epoch = info.get("reset_epoch")
+            now = time.time()
+            long_term = reason == "QUOTA_EXHAUSTED" or (delay is not None and delay > _CREDITS_LONG_DELAY_S)
+            if long_term and reset_epoch and now < reset_epoch <= now + _CREDITS_MAX_RESET_HORIZON:
+                _credits_cache_store(group, reset_epoch)
+                _log(f"Cached quota exhaustion for group={group} until epoch={int(reset_epoch)}")
+            _log("Upstream 429; retrying with GOOGLE_ONE_AI credits")
+            current_envelope = with_credits()
+            return True
+        if str(reason or "").upper() in _CREDITS_EXHAUSTED_REASONS:
+            return False
+        if delay is not None and delay > _TRANSIENT_MAX_DELAY_S:
+            return False
+        if transient_retries >= _TRANSIENT_MAX_RETRIES:
+            return False
+        backoff = _TRANSIENT_BACKOFFS[min(transient_retries, len(_TRANSIENT_BACKOFFS) - 1)]
+        wait = min(max(delay or backoff, 0.5), 5.0)
+        transient_retries += 1
+        _log(f"Transient 429; backoff retry {transient_retries}/{_TRANSIENT_MAX_RETRIES} in {wait:.1f}s")
+        time.sleep(wait)
+        return True
+
+    while True:
+        req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, current_envelope, streaming=True)
+        try:
+            resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
+        except HTTPError as e:
+            try:
+                body_bytes = e.read(_UPSTREAM_ERROR_READ_LIMIT + 1)  # body is readable only once
+            except Exception:
+                body_bytes = b""
+            _capture_upstream_error(e, current_envelope, body_bytes)
+            info = None
+            if e.code == 429:
+                info = _parse_429_info(body_bytes, getattr(e, "headers", None))
+            else:
+                _log(f"Upstream HTTP {e.code} on streamGenerateContent")
+            e.close()
+            if info is not None and handle_429(info):
+                continue
+            raise UpstreamError(f"Upstream stream HTTP {e.code}", status=e.code)
+        except URLError as e:
+            raise UpstreamError(f"Upstream stream network error: {e}", status=502)
+
+        data_lines = []
+        try:
+            try:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+                    line = line.rstrip("\r\n")
+                    if line == "":
+                        event = parse_event(data_lines)
+                        data_lines = []
+                        if event is not None:
+                            yielded_any = True
+                            yield event
+                            if event.get("__done__"):
+                                break
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip(" "))
+                else:
+                    event = parse_event(data_lines)
+                    if event is not None:
+                        yielded_any = True
+                        yield event
+                return
+            finally:
+                resp.close()
+        except UpstreamError as e:
+            if e.status == 429 and not yielded_any and \
+                    handle_429(getattr(e, "info", None) or _parse_429_info(None)):
+                continue
+            raise
 
 
 def _try_parse_one_event(buffer: str):
@@ -2203,6 +2573,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("upstream_error", "Upstream request failed", http_code=502)
             return
 
+        if _is_immediate_prohibited_content_event(first_event):
+            try:
+                gen.close()
+            except Exception:
+                pass
+            _log("Immediate PROHIBITED_CONTENT on first stream event; retrying upstream once")
+            try:
+                gen = iter(stream_generate_content(envelope))
+                first_event = next(gen)
+            except StopIteration:
+                self._send_error_json("upstream_error", "Empty upstream response", http_code=502)
+                return
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
+            except Exception as e:
+                _log(f"Upstream start failed: {type(e).__name__}")
+                self._send_error_json("upstream_error", "Upstream request failed", http_code=502)
+                return
+
         # Send SSE headers only after the upstream yielded its first event.
         try:
             self.close_connection = True
@@ -2253,6 +2643,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         total_usage = None
         events_processed = 0
         emitted_visible = False
+        is_argon = str(openai_model).startswith("gemini-4-argon")
+        saw_native_thought = False
+        argon_seam_resolved = False
+        argon_buffer = ""
 
         try:
             for event in itertools.chain((first_event,), gen):
@@ -2350,6 +2744,58 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         }
                         finish_reason = mapping.get(fr_up, "stop")
 
+                if is_argon:
+                    if reasoning_delta:
+                        saw_native_thought = True
+                        if argon_buffer:
+                            text_delta = argon_buffer + (text_delta or "")
+                            argon_buffer = ""
+                    elif not saw_native_thought and not argon_seam_resolved:
+                        if text_delta:
+                            argon_buffer += text_delta
+                            text_delta = ""
+                        if fr:
+                            has_tc = bool(tool_call_deltas or seen_tool_calls or finish_reason == "tool_calls")
+                            if pending_text:
+                                argon_buffer += pending_text
+                                pending_text = ""
+                                checking_text_call = False
+                            split_r, split_t = _split_unmarked_argon_thought(argon_buffer, has_tool_calls=has_tc)
+                            argon_buffer = ""
+                            argon_seam_resolved = True
+                            if split_r:
+                                if not send_sse({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": openai_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"reasoning_content": split_r},
+                                        "finish_reason": None,
+                                    }],
+                                }):
+                                    return
+                                if has_tc:
+                                    emitted_visible = True
+                            if split_t:
+                                textual_call = (
+                                    _parse_text_tool_call(split_t, allowed_tool_names)
+                                    if not blocked_reason
+                                    else None
+                                )
+                                if textual_call and (finish_reason == "tool_calls" or tool_call_deltas):
+                                    pass
+                                elif textual_call:
+                                    tool_call_deltas.append(
+                                        {"index": len(seen_tool_calls), **textual_call}
+                                    )
+                                    textual_calls_emitted += 1
+                                    if finish_reason != "length":
+                                        finish_reason = "tool_calls"
+                                else:
+                                    text_delta = split_t
+
                 # Build delta.
                 delta = {}
                 if reasoning_delta:
@@ -2378,7 +2824,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 }
                 if not send_sse(chunk):
                     return
-                if (delta.get("content") or "").strip() or delta.get("tool_calls"):
+                if (
+                    (delta.get("content") or "").strip()
+                    or delta.get("tool_calls")
+                    or (delta.get("reasoning_content") and (tool_call_deltas or seen_tool_calls or finish_reason == "tool_calls"))
+                ):
                     emitted_visible = True
 
             if blocked_reason:
@@ -2390,6 +2840,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 finish_reason = "length"
                 send_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created,
                           "model": openai_model, "choices": [{"index": 0, "delta": {"content": "[Upstream stream ended without finishReason]"}, "finish_reason": None}]})
+            if argon_buffer:
+                pending_text = argon_buffer + pending_text
+                argon_buffer = ""
             if pending_text:
                 textual_call = _parse_text_tool_call(pending_text, allowed_tool_names) if upstream_finished and not blocked_reason else None
                 if textual_call and finish_reason == "tool_calls":
@@ -2437,14 +2890,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Include usage in the final chunk if the client requested
             # stream_options.include_usage (OpenAI convention).
             if total_usage:
-                pt = total_usage.get("promptTokenCount", 0) or 0
-                ct = total_usage.get("candidatesTokenCount", 0) or total_usage.get("completionTokenCount", 0) or 0
-                tt = total_usage.get("totalTokenCount", (pt + ct)) or (pt + ct)
-                final_chunk["usage"] = {
-                    "prompt_tokens": pt,
-                    "completion_tokens": ct,
-                    "total_tokens": tt,
-                }
+                final_chunk["usage"] = _extract_usage({"usageMetadata": total_usage})
             send_sse(final_chunk)
 
             # Termination sentinel.
@@ -2497,12 +2943,20 @@ def _preflight_check():
 
 
 def main():
+    global CREDITS_FALLBACK_ENABLED
     parser = argparse.ArgumentParser(
         description="Antigravity OpenAI-compatible proxy (Cloud Code Assist API)"
     )
     parser.add_argument("--port", type=int, default=8877, help="Port to listen on (default 8877)")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default 127.0.0.1)")
+    parser.add_argument(
+        "--no-credits-fallback",
+        action="store_true",
+        help="Disable automatic fallback to GOOGLE_ONE_AI credits on HTTP 429",
+    )
     args = parser.parse_args()
+    if args.no_credits_fallback:
+        CREDITS_FALLBACK_ENABLED = False
 
     if not _preflight_check():
         sys.exit(1)
